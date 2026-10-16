@@ -1,0 +1,66 @@
+import { DownloadButton } from './DownloadButton';
+import { WorkspaceDemo } from './WorkspaceDemo';
+import { site } from '@/lib/site';
+import styles from './Hero.module.css';
+
+export const Hero = () => (
+  <section className={styles.hero} aria-labelledby="hero-title">
+    <div className={`wrap ${styles.grid}`}>
+      <div className={styles.copy}>
+        <h1 id="hero-title" className={styles.h1}>
+          <span>Every project.</span> <span>Every agent.</span> <span>Every key.</span>{' '}
+          <span>One window.</span>
+        </h1>
+        <p className={styles.lede}>
+          Styx is where everything converges: every repo you work in, the AI coding agents building in them,
+          and every login they need to ship. Switch between all of it from one window. And like the river
+          it&apos;s named after, nothing crosses over without you. Deploying, or touching live data, asks you
+          first.
+        </p>
+        <p className={styles.oss}>
+          Free and open source under Apache-2.0. <a href={site.links.github}>Read the code on GitHub</a>.
+        </p>
+        <div className={styles.ctas}>
+          <DownloadButton />
+          <a href="#access" className={styles.secondary}>
+            What happens at the crossing
+          </a>
+          <a href="/story" className={styles.secondary}>
+            Watch why I built it · 1:42
+          </a>
+        </div>
+        {/* Product Hunt's featured badge, in the site's theme: both load, CSS shows the one that matches. */}
+        <a
+          className={styles.ph}
+          href={site.links.productHunt}
+          target="_blank"
+          rel="noopener noreferrer"
+          aria-label="Styx on Product Hunt"
+        >
+          <img
+            className={styles.phLight}
+            alt="Styx - An agentic development environment (ADE) for Mac | Product Hunt"
+            width={250}
+            height={54}
+            src={site.links.productHuntBadge('light')}
+          />
+          <img
+            className={styles.phDark}
+            alt=""
+            aria-hidden="true"
+            width={250}
+            height={54}
+            src={site.links.productHuntBadge('dark')}
+          />
+        </a>
+        <p className={styles.micro}>
+          An agentic development environment (ADE) for Mac, with Windows and Linux in beta. Your keys never
+          leave your computer.
+        </p>
+      </div>
+      <div className={styles.demo} data-load="fade">
+        <WorkspaceDemo />
+      </div>
+    </div>
+  </section>
+);

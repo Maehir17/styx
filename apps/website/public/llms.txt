@@ -1,0 +1,42 @@
+# Styx
+
+> Styx is an agentic development environment (ADE): a Mac app for developers who run AI coding agents. It puts every project and every agent (Claude Code, OpenAI Codex, Gemini CLI, Cursor's agent and OpenCode) in one window, on top of the editor you already use, and makes agents ask before they touch production.
+
+Styx is free and open source (Apache-2.0). It runs on macOS on Apple silicon, and in beta on Windows 10 and 11 (x64) and Linux (AppImage or .deb). It is made by one person in South Africa.
+
+## What it does
+
+- One window for every project and every agent. A board shows which agents are working, which are done, and which are waiting on you; one keystroke opens the one that needs you.
+- Each agent works in its own git worktree and branch, so agents do not collide with each other or with you. Finished work is merged back ("landed") after your project's checks pass.
+- It sits on top of your existing editor: it imports your recent projects, keybindings and theme, and "Open in…" sends any file back to VS Code, Cursor or another IDE.
+- It uses the agent subscriptions and logins you already have (Claude, ChatGPT/Codex, Gemini, Cursor, and whichever providers OpenCode is signed in to). Styx does not resell model access.
+- Agents never hold your keys. When an agent wants to deploy or use a database or server (Vercel, Supabase, AWS, Google Cloud, Fly.io, Railway, Render, GitHub, SSH), it asks. You approve it for a set time; anything that writes to production needs Touch ID, Windows Hello or your system password. Access expires on its own.
+- Every request, approval, use and revoke goes into an append-only, hash-chained audit log on your computer.
+- Every task is a card on the Tasks tab: its agent, branch, status, whether it needs you and what it changed. Tasks are marked Design or Build when they start.
+- Design tab: a design task draws screens first (wireframe or high fidelity, at desktop, tablet and phone size, in the project's type and colours) as plain HTML files in the repo. Select an element or drag over an area to change it by hand or tell the agent, with a picture. "Build it" hands the screens to a linked build task, which is told when the design changes.
+- Preview runs the app locally beside the chat. "Select to fix": click or drag over what is wrong in the running app and the agent gets the element, its place in the code when the page exposes it, and a picture.
+- It also runs projects locally, connects deploy targets, reviews agents' changes hunk by hunk, and can run a background tech-debt review of a repository.
+
+## What it is not
+
+- It is a guardrail, not a sandbox: agents run as you, on your machine. Commands that go through Styx's tools are gated; an agent that deliberately goes around them is not stopped. Use least-privilege credentials for production.
+
+## Privacy
+
+- Your code, projects, prompts, agent conversations and credentials stay on your computer. Credentials are kept in the OS keychain (macOS Keychain, Windows Credential Manager, or the Secret Service keyring on Linux).
+- Styx counts a small, fixed set of product events (like launches and agents started) under a random install id, and can be turned off in Settings.
+
+## Links
+
+- [Documentation](https://heystyx.com/docs): getting started, every feature, access and security, guides, reference (settings, shortcuts, CLI, MCP tools, project.json, environment variables), troubleshooting and contributing
+- [Documentation as one text file](https://heystyx.com/llms-full.txt): every docs page in Markdown, for agents and LLM tools; any single page is also at https://heystyx.com/md/docs/<path>
+- [Source code](https://github.com/NicholasFlemmer/styx-app): Apache-2.0
+- [Home and download](https://heystyx.com/): features, screenshots and the Download for Mac button
+- [Download for Mac](https://heystyx.com/download/mac): the latest signed, notarized build
+- [Introducing Styx](https://heystyx.com/launch): the launch article — who makes it, why, what it does, how it was built and where it stops
+- [Styx in 21 seconds](https://heystyx.com/demo): a coding agent asks for prod database access, and the developer approves one hour with Touch ID
+- [Why I built Styx](https://heystyx.com/story): the founder video (1:42) with its full transcript
+- [Compare](https://heystyx.com/compare): how Styx compares with other ADEs and coding agent apps, including where each is ahead
+- [Privacy policy](https://heystyx.com/privacy)
+- [Terms of service](https://heystyx.com/terms)
+- Contact: hello@heystyx.com

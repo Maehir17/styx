@@ -1,0 +1,50 @@
+@layer components {
+  .wrap {
+    position: relative;
+    display: inline-flex;
+    min-width: 140px;
+    vertical-align: middle;
+    /* 25px visible box (prototype), 29px hit area (spec §9 ≥ 28): transparent padding cancelled by margin so
+       the line box and every row height stay put; the wrapper forwards clicks on the bleed to the select. */
+    padding: 2px 0;
+    margin: -2px 0;
+  }
+  .select {
+    appearance: none;
+    width: 100%;
+    /* prototype box is 25px: its ▾ glyph fell back to a taller font; our SVG chevron does not, so fix the height */
+    height: 25px;
+    border: 1px solid var(--ln);
+    background: transparent;
+    color: var(--tx);
+    /* 1 top / 3 bottom: Chromium centres option text in the content box, and the 2px difference lands it on the
+       prototype's rows. The 19px box leaves room for descenders: the earlier 13px one cut "y" and "p" at 2× (#44). */
+    padding: 1px 24px 3px 8px;
+    font-family: var(--font-ui);
+    font-size: 12px;
+    cursor: pointer;
+    border-radius: 0;
+  }
+  .select option {
+    background: var(--bg);
+    color: var(--tx);
+  }
+  .disabled {
+    opacity: 0.5;
+    pointer-events: none;
+  }
+  .chevron {
+    position: absolute;
+    right: 8px;
+    top: 50%;
+    margin-top: -6px;
+    color: var(--mu);
+    pointer-events: none;
+  }
+  .wrap[data-inv='true'] .select,
+  .wrap[data-inv='true'] .chevron,
+  .wrap[data-on='true'] .select,
+  .wrap[data-on='true'] .chevron {
+    color: inherit;
+  }
+}

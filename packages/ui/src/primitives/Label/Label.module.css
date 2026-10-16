@@ -1,0 +1,14 @@
+@layer components {
+  .label {
+    font-family: var(--font-ui);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--mu);
+    margin: 0;
+    padding: 0;
+  }
+  .strong {
+    font-weight: 700;
+    color: inherit;
+  }
+}

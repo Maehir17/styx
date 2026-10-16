@@ -1,0 +1,218 @@
+@layer components {
+  .msg {
+    max-width: 92%;
+    font-size: 13px;
+    line-height: 1.5;
+    border-radius: 0;
+    /* The reset turns selection off app-wide (chrome should not select). Transcript content is the exception:
+       without this there is nothing to select, so ⌘C copies nothing out of the chat. */
+    user-select: text;
+  }
+  .user {
+    align-self: flex-end;
+    max-width: 88%;
+    padding: 8px 10px;
+    background: var(--tx);
+    color: var(--bg);
+    line-height: 1.45;
+    white-space: pre-wrap;
+  }
+  /* Attachment chips inside the user bubble: inverted against the bubble (--bg on --tx → --tx on --bg), mono 11px. */
+  /* What the message points at (#140): a lime-edged chip on its own line above the text. */
+  .pointer {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    width: fit-content;
+    max-width: 100%;
+    margin-bottom: 6px;
+    padding: 2px 7px;
+    border: 1px solid var(--ac);
+    background: var(--bg);
+    color: var(--tx);
+    font-size: 12px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .pointer::before {
+    content: '';
+    flex: none;
+    width: 7px;
+    height: 7px;
+    background: var(--ac);
+  }
+  .attachments {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-top: 6px;
+  }
+  .user:empty + .attachments,
+  .attachments:first-child {
+    margin-top: 0;
+  }
+  .attachment {
+    display: inline-block;
+    max-width: 100%;
+    padding: 1px 6px;
+    background: var(--bg);
+    color: var(--tx);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    line-height: 1.5;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .agent {
+    padding: 8px 10px;
+    border: 1px solid var(--ln);
+  }
+  .system {
+    padding: 8px 10px;
+    border: 1px solid var(--ln);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--mu);
+  }
+  .files {
+    border: 1px solid var(--ln);
+    font-family: var(--font-mono);
+    font-size: 11px;
+  }
+  .file {
+    display: flex;
+    justify-content: space-between;
+    padding: 6px 10px;
+    border-bottom: 1px solid var(--ln);
+  }
+  .file:last-child {
+    border-bottom: 0;
+  }
+  .add {
+    color: var(--act);
+  }
+  .options {
+    display: flex;
+    gap: 6px;
+    margin-top: 8px;
+  }
+  /* Tool call (stream): one mono line, no bubble; error glyph and tool name in --tx. */
+  .tool {
+    max-width: 100%;
+    padding: 4px 0;
+    font-family: var(--font-mono);
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--mu);
+  }
+  .toolLine {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    min-width: 0;
+  }
+  .toolGlyph {
+    flex: none;
+    width: 1ch;
+    text-align: center;
+  }
+  .tool[data-status='error'] .toolGlyph {
+    color: var(--tx);
+  }
+  .toolName {
+    flex: none;
+    color: var(--tx);
+  }
+  .toolHint {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    white-space: nowrap;
+    text-overflow: ellipsis;
+  }
+  .toolDetail {
+    padding-left: calc(1ch + 8px);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  /* Streaming cursor (agent bubble / thinking body): blinks with the shared keyframes; reduced motion keeps it solid. */
+  .cursor {
+    display: inline-block;
+    margin-left: 1px;
+    color: var(--tx);
+    animation: styx-blink 1s steps(1) infinite;
+  }
+  /* Thinking block: t-label header + a quiet quote-like body (1px --ln left rule), no bubble. */
+  .thinking {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+  }
+  .thinkingHead {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    min-height: 16px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--mu);
+  }
+  .thinkingLabel {
+    font-variant-numeric: tabular-nums;
+  }
+  .thinkingToggle {
+    padding: 0;
+    border: 0;
+    min-height: 0;
+    line-height: normal;
+    font-size: 12px;
+    font-weight: 600;
+  }
+  .thinkingBody {
+    padding-left: 10px;
+    border-left: 1px solid var(--ln);
+    font-family: var(--font-ui);
+    font-size: 12.5px;
+    line-height: 1.5;
+    color: var(--mu);
+    white-space: pre-wrap;
+    overflow-wrap: anywhere;
+  }
+  .request {
+    border: 1px solid var(--ac);
+  }
+  .requestHeader {
+    padding: 6px 10px;
+    background: var(--ac);
+    color: var(--acx);
+    font-size: 12px;
+    font-weight: 700;
+  }
+  .requestBody {
+    padding: 10px;
+    font-size: 12px;
+  }
+  .requestActions {
+    display: flex;
+    gap: 6px;
+    padding: 0 10px 10px;
+  }
+
+  .compact.user,
+  .compact.agent,
+  .compact.system {
+    padding: 7px 10px;
+  }
+  .compact.user,
+  .compact.agent {
+    font-size: 12.5px;
+  }
+  .compact.tool {
+    font-size: 12px;
+  }
+  .compact .thinkingBody {
+    font-size: 12px;
+  }
+}

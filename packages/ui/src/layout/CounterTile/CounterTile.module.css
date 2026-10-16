@@ -1,0 +1,26 @@
+@layer components {
+  .strip {
+    display: grid;
+    border-bottom: 1px solid var(--ln);
+    flex: none;
+  }
+  .tile {
+    padding: 22px 20px 18px;
+    border-right: 1px solid var(--ln);
+    min-width: 0;
+  }
+  .numeral {
+    display: block;
+  }
+  /* Attention (ADR-0027 §6): the number turns accent-as-text; the tile itself stays quiet. */
+  .tile[data-attention='true'] .numeral {
+    color: var(--act);
+  }
+  .label {
+    margin-top: 10px;
+    font-family: var(--font-ui);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--mu);
+  }
+}

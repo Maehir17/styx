@@ -1,0 +1,179 @@
+import { z } from 'zod';
+import { projectIdSchema, repoIdSchema, sessionIdSchema, timestampSchema, worktreeIdSchema } from './common';
+
+export const projectSchema = z.object({
+  id: projectIdSchema,
+  name: z.string().min(1),
+  path: z.string().min(1),
+  initials: z.string().min(1).max(3),
+  railOrder: z.number().int(),
+  /** Whether a `.styx/project.json` was found; its parsed settings live in ReadModel.settings.project. */
+  hasProjectFile: z.boolean(),
+  createdAt: timestampSchema,
+  lastActivityAt: timestampSchema.nullable(),
+  removedAt: timestampSchema.nullable(),
+});
+export type Project = z.infer<typeof projectSchema>;
+
+export const lineEndingsSchema = z.enum(['auto', 'lf', 'crlf']);
+export type LineEndings = z.infer<typeof lineEndingsSchema>;
+
+export const repoRemoteSchema = z.object({ name: z.string(), url: z.string() });
+export type RepoRemote = z.infer<typeof repoRemoteSchema>;
+
+/**
+ * One repo row per project, git or not. A folder added as-is (no `.git`) keeps `defaultBranch: null`, no remotes and
+ * a single main worktree whose `branch` is null; that null is the whole "has git" flag (see `repoHasGit`), so no extra
+ * column exists. `project.gitInit` fills both in.
+ */
+export const repoSchema = z.object({
+  id: repoIdSchema,
+  projectId: projectIdSchema,
+  defaultBranch: z.string().min(1).nullable(),
+  remotes: z.array(repoRemoteSchema),
+  ahead: z.number().int().nonnegative(),
+  behind: z.number().int().nonnegative(),
+  fetchedAt: timestampSchema.nullable(),
+  lineEndings: lineEndingsSchema,
+  longPaths: z.boolean(),
+});
+export type Repo = z.infer<typeof repoSchema>;
+
+/** Whether the project's folder is a git repository (worktrees, diffs and reviews need it). */
+export const repoHasGit = (repo: Pick<Repo, 'defaultBranch'> | null | undefined): boolean =>
+  repo !== null && repo !== undefined && repo.defaultBranch !== null;
+
+export const prStateSchema = z.enum(['draft', 'open', 'merged', 'closed']);
+export type PrState = z.infer<typeof prStateSchema>;
+
+export const worktreeOwnerSchema = z.discriminatedUnion('kind', [
+  z.object({ kind: z.literal('user') }),
+  z.object({ kind: z.literal('session'), sessionId: sessionIdSchema }),
+]);
+export type WorktreeOwner = z.infer<typeof worktreeOwnerSchema>;
+
+export const worktreePrSchema = z.object({
+  number: z.number().int().positive(),
+  state: prStateSchema,
+  url: z.string().nullable(),
+});
+export type WorktreePr = z.infer<typeof worktreePrSchema>;
+
+export const worktreeConflictSchema = z.object({ file: z.string(), against: z.string() });
+export type WorktreeConflict = z.infer<typeof worktreeConflictSchema>;
+
+/**
+ * Another live lane that changed the same files (owner addition, ADR-0025 "lanes that know about each other").
+ * Advisory: refreshed by the lane ledger on every hunk rescan and lane refresh; never a lock.
+ */
+export const worktreeOverlapSchema = z.object({
+  worktreeId: worktreeIdSchema,
+  files: z.array(z.string().min(1)),
+});
+export type WorktreeOverlap = z.infer<typeof worktreeOverlapSchema>;
+
+/**
+ * A merge of the base branch that Styx is finishing with an agent (ADR-0025 phase B): the conflicted files, who is
+ * resolving, what the lane looked like before (for Undo), and how it ended.
+ */
+export const worktreeResolutionSchema = z.object({
+  state: z.enum(['resolving', 'checking', 'done', 'failed']),
+  /** The lane's own session, or the hidden `merge` task spawned for a lane whose agent was gone; null when nothing had to be asked. */
+  sessionId: sessionIdSchema.nullable(),
+  files: z.array(z.string()),
+  /** HEAD before the merge began, and a checkpoint commit of the working tree then (null when it was clean). */
+  preHead: z.string(),
+  preTree: z.string().nullable(),
+  /** The merge commit once it landed. */
+  mergeCommit: z.string().nullable(),
+  attempts: z.number().int().nonnegative(),
+  startedAt: timestampSchema,
+  finishedAt: timestampSchema.nullable(),
+  /** Why it was given up, or the checks' output tail, for the human. */
+  failure: z.string().nullable(),
+});
+export type WorktreeResolution = z.infer<typeof worktreeResolutionSchema>;
+
+/** A lane landed in the base branch (ADR-0025 phase C): the landing commit on the base, whether it was pushed, and if it was undone. */
+export const worktreeLandingSchema = z.object({
+  commit: z.string(),
+  base: z.string(),
+  pushed: z.boolean(),
+  at: timestampSchema,
+  undoneAt: timestampSchema.nullable(),
+  /** The revert commit an Undo put on the base; the next landing reapplies it so the lane's work can go back in. */
+  revertCommit: z.string().nullable().default(null),
+});
+export type WorktreeLanding = z.infer<typeof worktreeLandingSchema>;
+
+export const worktreeSchema = z.object({
+  id: worktreeIdSchema,
+  repoId: repoIdSchema,
+  projectId: projectIdSchema,
+  /** Null only on the main worktree of a plain (non-git) folder. */
+  branch: z.string().min(1).nullable(),
+  path: z.string().min(1),
+  isMain: z.boolean(),
+  owner: worktreeOwnerSchema,
+  baseCommit: z.string().nullable(),
+  headCommit: z.string().nullable(),
+  changes: z.object({
+    added: z.number().int().nonnegative(),
+    removed: z.number().int().nonnegative(),
+    files: z.number().int().nonnegative(),
+  }),
+  pr: worktreePrSchema.nullable(),
+  conflict: worktreeConflictSchema.nullable(),
+  /** Commits on the project's base branch this lane has not merged in yet (`worktree.fetch` / `worktree.sync`). */
+  behindBase: z.number().int().nonnegative().default(0),
+  /** Other live lanes that changed files this lane changed too (ADR-0025). */
+  overlaps: z.array(worktreeOverlapSchema).default([]),
+  /** A base merge being finished with an agent, or how the last one ended (ADR-0025 phase B). */
+  resolution: worktreeResolutionSchema.nullable().default(null),
+  /** How this lane landed in the base (phase C); null until it does. */
+  landing: worktreeLandingSchema.nullable().default(null),
+  mergedAt: timestampSchema.nullable(),
+  createdAt: timestampSchema,
+  archivedAt: timestampSchema.nullable(),
+});
+export type Worktree = z.infer<typeof worktreeSchema>;
+
+/**
+ * Directories the file pane never descends into (discrepancy #115). Shared so main's walker and the renderer
+ * agree; a mismatch would mean walking a tree the pane then throws away.
+ */
+export const TREE_IGNORED_DIRS: readonly string[] = [
+  '.git',
+  '.styx',
+  'node_modules',
+  // Build and cache output of the common toolchains (performance, 2026-09-25): a dev server rewrites these many
+  // times a second, and Next.js's `.next` alone is thousands of files. The watcher skips the same folders.
+  '.next',
+  '.nuxt',
+  '.svelte-kit',
+  '.turbo',
+  '.vercel',
+  '.netlify',
+  '.expo',
+  '.cache',
+  '.parcel-cache',
+  '.angular',
+  '.gradle',
+  '.dart_tool',
+  '.venv',
+  'venv',
+  '__pycache__',
+  '.pytest_cache',
+  '.mypy_cache',
+  'dist',
+  'build',
+  'out',
+  'coverage',
+  'target',
+  'Pods',
+  'DerivedData',
+];
+
+/** How deep the tree goes, and the most nodes it will carry before saying it is partial. */
+export const TREE_MAX_DEPTH = 4;
+export const TREE_MAX_NODES = 20_000;

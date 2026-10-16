@@ -1,0 +1,535 @@
+import { copy, fill, type Session, type Worktree, type WorktreeLanding } from '@styx/core';
+import type { Clock } from '../clock';
+import type { Repos } from '../db/repos';
+import { fail } from '../ipc/bus';
+import type { Publisher } from '../store/publisher';
+import type { ActivityService } from './activity-service';
+import { blockingChanges, type GitService } from './git';
+import { isSecretFile, logger } from './logger';
+import type { FreshenResult } from './lane-sync-service';
+import type { ChecksResult } from './merge-resolve-service';
+import { fallbackDraft, statsOf, type PublishMessage, type PublishResult } from './publish-service';
+import type { TranscriptService } from './transcript-service';
+
+export interface LandSettings {
+  integration: 'auto' | 'review';
+  autoLand: boolean;
+  checksCommand: string | null;
+}
+
+export interface LandDeps {
+  repos: Repos;
+  git: GitService;
+  publisher: Publisher;
+  clock: Clock;
+  transcript: TranscriptService;
+  activity: ActivityService;
+  baseOf: (projectId: string) => string;
+  settingsOf: (projectId: string) => LandSettings;
+  /**
+   * Keep lanes current (ADR-0023): the local base is brought up to its upstream first (a landing must merge onto
+   * the base as it is on the remote, or the push is refused), the base comes into the lane, a conflict goes to the
+   * resolver. `baseRefOf` is what git is asked about; `baseOf` is the name people see.
+   */
+  laneSync: {
+    sync(
+      worktreeId: string,
+      opts?: { caller?: string | null },
+    ): Promise<{ merged: number; conflict: { file: string } | null }>;
+    freshenBase(projectId: string): Promise<FreshenResult>;
+    baseRefOf(projectId: string): string;
+  };
+  resolver: {
+    resolve(worktreeId: string, opts?: { caller?: string | null }): Promise<{ started: boolean }>;
+    /** Verifies a merge being finished now, rather than when the agent's turn ends. */
+    verifyNow?(worktreeId: string): Promise<void>;
+  };
+  /**
+   * Publish's own steps (ADR-0021): the lane's commit (secret files stay out, the user's identity) and the base's
+   * push (the same grant, audit and activity path as the Publish button).
+   */
+  publish: {
+    publish(
+      worktreeId: string,
+      opts: { through: 'commit' | 'push'; message: PublishMessage; draft: boolean },
+    ): Promise<PublishResult>;
+  };
+  runChecks: (cwd: string, command: string) => Promise<ChecksResult>;
+  /** Removes a lane's checkout and marks it archived (`WorktreeService.archive`): the tidy-up after a landing. */
+  archive: (worktreeId: string) => Promise<void>;
+  /** A lane reached the base: counted as `lane.landed` (discrepancy #122), however it was landed. */
+  onLanded?: () => void;
+  /**
+   * Issue #2: a Styx-authored turn to the lane's agent (`SessionService.sendMessage`, from Styx, now) — how the
+   * first landing in a project with no checks asks that agent to work them out. Without it Land never asks.
+   */
+  askAgent?: (sessionId: string, text: string) => Promise<void>;
+}
+
+export interface LandFile {
+  path: string;
+  added: number;
+  removed: number;
+}
+
+export interface LandPreview {
+  base: string;
+  files: LandFile[];
+  willPush: boolean;
+  remote: string | null;
+}
+
+export interface LandResult {
+  commit: string;
+  pushed: boolean;
+  steps: string[];
+}
+
+/**
+ * Landing (ADR-0025 phase C): a lane's work goes into the base branch in one step. What is uncommitted is
+ * committed first (agents seldom commit on their own); the base is brought into the lane (a conflict goes to the
+ * resolver and the landing waits for it); the project's checks run in the lane; the lane is merged into the base
+ * with `--no-ff` and the summary as the record; the base is pushed when it has a remote; and the lane stays,
+ * marked landed, with Undo (a revert of the landing commit) while that commit is still the base's HEAD.
+ *
+ * Landings of one project run one after another: the next one brings the freshly moved base into its lane before
+ * anything else — the sequential, gated merging the research recommends. With `autoLand` on (auto mode only), a
+ * lane lands by itself when its session finishes cleanly; that path never spends a prompt on the summary.
+ */
+export class LandService {
+  private readonly queues = new Map<string, Promise<unknown>>();
+  /** The last reason an automatic landing was refused, per lane: a standing reason is said once, not every turn. */
+  private readonly refused = new Map<string, string>();
+  /**
+   * Issue #2: projects whose checks Land asked an agent to work out → that session (it alone may then teach them,
+   * `askedForChecks`), or null once they were learned. Asked once per project per run of Styx: the next Land with
+   * still none known goes ahead without checks and says so, rather than asking again and again.
+   */
+  private readonly checksAsked = new Map<string, string | null>();
+
+  constructor(private readonly deps: LandDeps) {}
+
+  /** The files the lane would land (committed and not), and where the base goes afterwards. */
+  async preview(worktreeId: string): Promise<LandPreview> {
+    const { repos } = this.deps;
+    const wt = repos.worktrees.get(worktreeId) ?? fail('not-found', `worktree ${worktreeId} not found`);
+    const branch = wt.branch ?? fail('invalid-input', copy.publish.noBranch);
+    const project = repos.projects.get(wt.projectId) ?? fail('not-found', 'project not found');
+    const base = this.deps.baseOf(project.id);
+    const files = await this.filesOf(project.path, wt.path, this.deps.laneSync.baseRefOf(project.id), branch);
+    const remote = await this.remoteOf(project.path);
+    return { base, files, willPush: remote !== null, remote };
+  }
+
+  /**
+   * Lands the lane; landings of one project run one after another. `caller` is the session asking through the
+   * `land` tool: its own lane is landed even though it is mid-turn (it is waiting on this very call).
+   */
+  land(
+    worktreeId: string,
+    message: PublishMessage,
+    opts: { auto?: boolean; caller?: string } = {},
+  ): Promise<LandResult> {
+    const wt =
+      this.deps.repos.worktrees.get(worktreeId) ?? fail('not-found', `worktree ${worktreeId} not found`);
+    const prev = this.queues.get(wt.projectId) ?? Promise.resolve();
+    const go = () => this.doLand(worktreeId, message, opts.auto === true, opts.caller ?? null);
+    const run = prev.then(go, go);
+    this.queues.set(
+      wt.projectId,
+      run.catch(() => undefined),
+    );
+    return run;
+  }
+
+  private async doLand(
+    worktreeId: string,
+    message: PublishMessage,
+    auto: boolean,
+    caller: string | null,
+  ): Promise<LandResult> {
+    const { repos, git, clock } = this.deps;
+    let wt = repos.worktrees.get(worktreeId) ?? fail('not-found', `worktree ${worktreeId} not found`);
+    if (wt.isMain) fail('invalid-input', 'the main worktree is the base; nothing to land');
+    if (wt.archivedAt !== null) fail('invalid-input', 'the lane is archived');
+    const branch = wt.branch ?? fail('invalid-input', copy.publish.noBranch);
+    const project = repos.projects.get(wt.projectId) ?? fail('not-found', 'project not found');
+    const base = this.deps.baseOf(project.id);
+    const owner = wt.owner.kind === 'session' ? repos.sessions.get(wt.owner.sessionId) : null;
+    const agent = copy.agentProducts[owner?.agent ?? 'claude'];
+    const byOwner = owner !== null && caller === owner.id;
+    if (!byOwner && owner !== null && owner.state === 'working')
+      fail('invalid-input', fill(copy.land.busy, { agent, branch }));
+    if (!byOwner && owner !== null && owner.state === 'needs-you')
+      fail('invalid-input', fill(copy.land.waiting, { agent, branch }));
+    const finishing = (r: typeof wt.resolution) =>
+      r !== null && (r.state === 'resolving' || r.state === 'checking');
+    if (finishing(wt.resolution) && wt.resolution !== null) {
+      // An agent calling `land` on its own lane is saying the merge is finished — from inside its turn, so the
+      // settle that would verify it has not come. Nor has it for an agent that is not working any more. Verify
+      // now rather than refuse; the refusal stays for a merge that is genuinely still being done.
+      const resolver = wt.resolution.sessionId === null ? null : repos.sessions.get(wt.resolution.sessionId);
+      if (byOwner || resolver === null || resolver.state !== 'working')
+        await this.deps.resolver.verifyNow?.(wt.id);
+      wt = repos.worktrees.get(wt.id) ?? wt;
+      if (finishing(wt.resolution))
+        fail(
+          'invalid-transition',
+          fill(copy.land.resolving, { base, agent }) +
+            (wt.resolution?.failure ? `\n${wt.resolution.failure}` : ''),
+        );
+    }
+    // The base is merged in its own checkout: it has to be on the base, and clean.
+    const current = await git.currentBranch(project.path);
+    if (current !== base)
+      fail('invalid-input', fill(copy.land.baseNotCheckedOut, { current: current ?? '?', base }));
+    if (blockingChanges(await git.status(project.path)).length > 0)
+      fail('invalid-input', fill(copy.land.dirtyBase, { base }));
+    // The base as it is on the remote, before anything is measured against it or merged onto it: a landing onto a
+    // stale local base pushes as a non-fast-forward and is refused by the remote — after the merge is made.
+    if ((await git.remotes(project.path)).length > 0) await git.fetch(project.path).catch(() => undefined);
+    const fresh = await this.deps.laneSync.freshenBase(project.id);
+    if (fresh.state === 'diverged')
+      fail(
+        'invalid-input',
+        fill(copy.land.baseDiverged, {
+          base,
+          upstream: fresh.upstream,
+          ahead: fresh.ahead,
+          behind: fresh.behind,
+        }),
+      );
+
+    const steps: string[] = [];
+    // 1. Commit what the agent left uncommitted, as Publish would (by name; secret files stay out).
+    if (!(await git.status(wt.path)).clean) {
+      const r = await this.deps.publish.publish(wt.id, { through: 'commit', message, draft: false });
+      if (r.commit !== null) steps.push(fill(copy.land.steps.commit, { commit: r.commit.slice(0, 7) }));
+    }
+    // 1b. An undone landing left a revert on the base, so the lane's commits are already ancestors of it and a
+    // plain merge would bring nothing back. The revert is reverted first (the base regains the work), and then
+    // the sync below carries that through the lane instead of wiping its tree with the revert.
+    const undone = wt.landing;
+    let reapplied: string | null = null;
+    if (
+      undone !== null &&
+      undone.undoneAt !== null &&
+      undone.revertCommit !== null &&
+      (await git.isAncestor(project.path, undone.revertCommit, base))
+    ) {
+      const r = await git.revertCommit(project.path, undone.revertCommit);
+      if (!r.ok) fail('git-error', r.output || 'git revert failed');
+      reapplied = (await git.headCommit(project.path)) ?? undone.revertCommit;
+      steps.push(fill(copy.land.steps.reapply, { base, commit: reapplied.slice(0, 7) }));
+      this.patch(wt.id, (w) => ({ ...w, landing: { ...undone, revertCommit: null } }));
+    }
+    let commit: string;
+    if (reapplied !== null && (await git.aheadBehind(project.path, branch, base)).ahead === 0) {
+      // Nothing new on the lane since the undone landing: the reapply is the landing, and it is one commit.
+      commit = reapplied;
+    } else {
+      // 2. The base comes into the lane; a conflict is the resolver's and the landing waits for it.
+      const by = byOwner ? { caller } : {};
+      const synced = await this.deps.laneSync.sync(wt.id, by);
+      if (synced.conflict !== null) {
+        await this.deps.resolver.resolve(wt.id, by).catch(() => undefined);
+        fail('invalid-transition', fill(copy.land.resolving, { base, agent }));
+      }
+      if (synced.merged > 0) steps.push(fill(copy.land.steps.sync, { base, n: synced.merged }));
+      if ((await git.aheadBehind(project.path, branch, base)).ahead === 0)
+        fail('invalid-input', fill(copy.land.nothing, { branch, base }));
+      // 3. The checks, in the lane, before anything reaches the base. None known yet: the lane's agent is asked to
+      // work them out first (issue #2), once; after that — or with no agent to ask — the landing says none ran.
+      const checks = this.deps.settingsOf(project.id).checksCommand;
+      if (checks === null) {
+        const asked = await this.askForChecks(project.id, owner, byOwner, branch, base);
+        if (asked !== null) fail('invalid-transition', asked);
+        steps.push(copy.land.steps.noChecks);
+      } else {
+        const r = await this.deps.runChecks(wt.path, checks);
+        if (r.exitCode !== 0)
+          fail(
+            'invalid-transition',
+            fill(copy.land.checksFailed, { command: checks, code: r.exitCode, branch }) +
+              (r.output === '' ? '' : `\n${r.output}`),
+          );
+        steps.push(copy.land.steps.checks);
+      }
+      // 4. The merge into the base: one commit naming the lane, the summary as its message.
+      const text = message.body.trim() === '' ? message.title : `${message.title}\n\n${message.body}`;
+      const merged = await git.mergeNoFf(project.path, branch, text);
+      if (!merged.ok) {
+        const file = (await git.conflictedFiles(project.path).catch(() => []))[0] ?? copy.general.none;
+        await git.mergeAbort(project.path).catch(() => undefined);
+        fail('git-error', fill(copy.land.conflict, { branch, file, base }));
+      }
+      commit = (await git.headCommit(project.path)) ?? fail('git-error', 'no commit after the merge');
+      steps.push(fill(copy.land.steps.merge, { base, commit: commit.slice(0, 7) }));
+    }
+    // 5. Push the base when it has somewhere to go.
+    const mainRow = repos.worktrees.byProject(project.id).find((w) => w.isMain) ?? null;
+    const remote = await this.remoteOf(project.path);
+    let pushed = false;
+    if (remote !== null && mainRow !== null) {
+      pushed = (await this.deps.publish.publish(mainRow.id, { through: 'push', message, draft: false }))
+        .pushed;
+      if (pushed) steps.push(fill(copy.land.steps.push, { base }));
+    }
+    // 6. Rows, the chat, Home. The lane stays, landed, with Undo.
+    const now = clock.now();
+    const landing: WorktreeLanding = { commit, base, pushed, at: now, undoneAt: null, revertCommit: null };
+    this.patch(wt.id, (w) => ({ ...w, mergedAt: now, landing, behindBase: 0, conflict: null }));
+    if (mainRow !== null) this.patch(mainRow.id, (w) => ({ ...w, headCommit: commit }));
+    const pushedSuffix = pushed ? fill(copy.land.pushedSuffix, { remote: remote ?? '' }) : '';
+    if (owner !== null)
+      this.deps.transcript.system(
+        owner.id,
+        fill(auto ? copy.land.chatAuto : copy.land.chat, { branch, base, pushed: pushedSuffix }),
+      );
+    this.deps.activity.append({
+      who: (auto || byOwner) && owner !== null ? copy.agentProducts[owner.agent] : copy.repo.you,
+      what: `${project.name} · ${fill(
+        auto
+          ? copy.land.activity.landedAuto
+          : byOwner
+            ? copy.land.activity.landedAsked
+            : copy.land.activity.landed,
+        { branch, base },
+      )}`,
+      projectId: project.id,
+      sessionId: owner?.id ?? null,
+    });
+    logger.info('land: landed', { branch, base, commit, pushed, auto });
+    this.deps.onLanded?.();
+    this.refused.delete(wt.id);
+    // The base moved: earlier landings of this project are past their Undo window.
+    await this.settle(project.id).catch((e: Error) => logger.warn('land: tidy failed', { error: e.message }));
+    return { commit, pushed, steps };
+  }
+
+  /**
+   * Landed lanes, settled: one with new work on it (uncommitted, or commits the base lacks) is live again — the
+   * ordinary row, Land on offer, its landing kept for the record; one with nothing new whose landing is no longer
+   * the base's HEAD (Undo is over) is tidied away — archived, its session ended — unless its agent is mid-turn.
+   */
+  async settle(projectId: string): Promise<void> {
+    const { repos, git } = this.deps;
+    const project = repos.projects.get(projectId);
+    if (!project) return;
+    const landed = repos.worktrees
+      .byProject(projectId)
+      .filter(
+        (w) =>
+          !w.isMain &&
+          w.archivedAt === null &&
+          w.branch !== null &&
+          w.mergedAt !== null &&
+          w.landing !== null &&
+          w.landing.undoneAt === null,
+      );
+    if (landed.length === 0) return;
+    const base = this.deps.baseOf(project.id);
+    const head = await git.headCommit(project.path).catch(() => null);
+    for (const wt of landed) {
+      const branch = wt.branch ?? '';
+      const dirty = !(await git.status(wt.path).catch(() => ({ clean: true }))).clean;
+      const ahead = (await git.aheadBehind(project.path, branch, base).catch(() => null))?.ahead ?? 0;
+      if (dirty || ahead > 0) {
+        this.patch(wt.id, (w) => ({ ...w, mergedAt: null }));
+        logger.info('land: lane live again after landing', { branch });
+        continue;
+      }
+      if (head === null || head === wt.landing?.commit) continue;
+      const owner = wt.owner.kind === 'session' ? repos.sessions.get(wt.owner.sessionId) : null;
+      if (owner !== null && (owner.state === 'working' || owner.state === 'needs-you')) continue;
+      if (owner !== null && owner.state !== 'done')
+        this.deps.transcript.system(owner.id, fill(copy.land.archived, { branch, base }));
+      await this.deps.archive(wt.id);
+      this.deps.activity.append({
+        who: copy.repo.you,
+        what: `${project.name} · ${fill(copy.land.activity.archived, { branch })}`,
+        projectId: project.id,
+        sessionId: owner?.id ?? null,
+      });
+      logger.info('land: landed lane tidied away', { branch, base });
+    }
+  }
+
+  /** Issue #2: this session is the one Land asked for the project's checks (it may call `remember_command` checks). */
+  askedForChecks(sessionId: string): boolean {
+    return [...this.checksAsked.values()].includes(sessionId);
+  }
+
+  /** Issue #2: the project's checks were taught; the ask is spent. */
+  checksLearned(projectId: string): void {
+    this.checksAsked.set(projectId, null);
+  }
+
+  /**
+   * The first landing with no checks known asks the lane's agent to work them out (the way Run locally and Deploy
+   * hand the first attempt to an agent) and returns why nothing landed; null when there is nobody to ask — no
+   * agent session, a shell, a background task, one that is not idle — or it was asked already: land without.
+   */
+  private async askForChecks(
+    projectId: string,
+    owner: Session | null,
+    byOwner: boolean,
+    branch: string,
+    base: string,
+  ): Promise<string | null> {
+    const ask = this.deps.askAgent;
+    if (ask === undefined || this.checksAsked.has(projectId)) return null;
+    if (owner === null || owner.agent === 'shell' || owner.purpose) return null;
+    if (!byOwner && owner.state !== 'idle') return null;
+    const review = this.deps.settingsOf(projectId).integration === 'review';
+    const prompt = fill(copy.agentPrompt.learnChecks, {
+      branch,
+      base,
+      then: review && !byOwner ? copy.agentPrompt.learnChecksThenTell : copy.agentPrompt.learnChecksThenLand,
+    });
+    this.checksAsked.set(projectId, owner.id);
+    // The agent asked from inside its turn (the `land` tool): the refusal it reads is the ask.
+    if (byOwner) return prompt;
+    try {
+      await ask(owner.id, prompt);
+    } catch (e) {
+      logger.warn('land: could not ask for the checks', { error: (e as Error).message });
+      this.checksAsked.set(projectId, null);
+      return null;
+    }
+    logger.info('land: asked the agent for the checks', { branch });
+    return fill(review ? copy.land.learningChecksReview : copy.land.learningChecks, {
+      branch,
+      agent: copy.agentProducts[owner.agent],
+    });
+  }
+
+  /** The agent went quiet: landed lanes settle, then the lane may land on its own. */
+  async onTurnSettled(sessionId: string): Promise<void> {
+    const session = this.deps.repos.sessions.get(sessionId);
+    if (!session || session.purpose) return;
+    await this.settle(session.projectId);
+    await this.maybeAutoLand(sessionId);
+  }
+
+  /** The session reached `done`: the same, for a CLI that ended by itself. */
+  async onSessionFinished(sessionId: string): Promise<void> {
+    return this.onTurnSettled(sessionId);
+  }
+
+  /** Takes a landing back out of the base while it is the base's HEAD: a revert commit, pushed again if the landing was. */
+  async undo(worktreeId: string): Promise<void> {
+    const { repos, git, clock } = this.deps;
+    const wt = repos.worktrees.get(worktreeId) ?? fail('not-found', `worktree ${worktreeId} not found`);
+    const landing = wt.landing;
+    if (landing === null || landing.undoneAt !== null) fail('invalid-transition', copy.land.undoNothing);
+    const project = repos.projects.get(wt.projectId) ?? fail('not-found', 'project not found');
+    const base = landing.base;
+    const branch = wt.branch ?? '';
+    const current = await git.currentBranch(project.path);
+    if (current !== base)
+      fail('invalid-input', fill(copy.land.baseNotCheckedOut, { current: current ?? '?', base }));
+    if ((await git.headCommit(project.path)) !== landing.commit)
+      fail('invalid-transition', fill(copy.land.undoMoved, { base }));
+    if (blockingChanges(await git.status(project.path)).length > 0)
+      fail('invalid-input', fill(copy.land.dirtyBase, { base }));
+    // A landing is a merge commit, except a re-land that reapplied an undone one (a single revert-of-a-revert).
+    const r =
+      (await git.parentCount(project.path, landing.commit)) > 1
+        ? await git.revertMerge(project.path, landing.commit)
+        : await git.revertCommit(project.path, landing.commit);
+    if (!r.ok) fail('git-error', r.output || 'git revert failed');
+    const reverted = (await git.headCommit(project.path)) ?? landing.commit;
+    const mainRow = repos.worktrees.byProject(project.id).find((w) => w.isMain) ?? null;
+    const remote = await this.remoteOf(project.path);
+    let pushed = false;
+    if (landing.pushed && remote !== null && mainRow !== null) {
+      const message = { title: `Revert "${branch}"`, body: '' };
+      pushed = (await this.deps.publish.publish(mainRow.id, { through: 'push', message, draft: false }))
+        .pushed;
+    }
+    const now = clock.now();
+    this.patch(wt.id, (w) => ({
+      ...w,
+      mergedAt: null,
+      landing: { ...landing, undoneAt: now, revertCommit: reverted },
+    }));
+    if (mainRow !== null) this.patch(mainRow.id, (w) => ({ ...w, headCommit: reverted }));
+    const owner = wt.owner.kind === 'session' ? repos.sessions.get(wt.owner.sessionId) : null;
+    const pushedSuffix = pushed ? fill(copy.land.pushedSuffix, { remote: remote ?? '' }) : '';
+    if (owner !== null)
+      this.deps.transcript.system(owner.id, fill(copy.land.undone, { branch, base, pushed: pushedSuffix }));
+    this.deps.activity.append({
+      who: copy.repo.you,
+      what: `${project.name} · ${fill(copy.land.activity.undone, { branch, base })}`,
+      projectId: project.id,
+      sessionId: owner?.id ?? null,
+    });
+    logger.info('land: undone', { branch, base, reverted, pushed });
+  }
+
+  /**
+   * `autoLand` (auto mode): the agent went quiet, or its CLI ended cleanly — land its lane if it has anything for
+   * the base. A refusal is a line in the chat (once per standing reason), never a crash: Land stays on the Repo
+   * row.
+   */
+  async maybeAutoLand(sessionId: string): Promise<void> {
+    const { repos, git } = this.deps;
+    const session = repos.sessions.get(sessionId);
+    if (!session || session.purpose) return;
+    if (session.state === 'done' ? session.exitCode !== 0 : session.state !== 'idle') return;
+    const settings = this.deps.settingsOf(session.projectId);
+    if (settings.integration !== 'auto' || !settings.autoLand) return;
+    const wt = repos.worktrees.get(session.worktreeId);
+    if (!wt || wt.isMain || wt.archivedAt !== null || wt.branch === null || wt.mergedAt !== null) return;
+    const project = repos.projects.get(wt.projectId);
+    if (!project) return;
+    const base = this.deps.baseOf(project.id);
+    const files = await this.filesOf(project.path, wt.path, base, wt.branch).catch(() => []);
+    const ahead = (await git.aheadBehind(project.path, wt.branch, base).catch(() => null))?.ahead ?? 0;
+    if (files.length === 0 && ahead === 0) return;
+    const message = fallbackDraft(files, 'commit', wt.branch);
+    try {
+      await this.land(wt.id, message, { auto: true });
+    } catch (e) {
+      const reason = ((e as Error).message.split('\n')[0] ?? '').trim();
+      if (this.refused.get(wt.id) === reason) return;
+      this.refused.set(wt.id, reason);
+      this.deps.transcript.system(session.id, fill(copy.land.failed, { error: reason }));
+      logger.info('land: automatic landing did not happen', { branch: wt.branch, reason });
+    }
+  }
+
+  /** Committed against the base plus what is still uncommitted, one line per file (secret files never counted). */
+  private async filesOf(
+    projectPath: string,
+    lanePath: string,
+    base: string,
+    branch: string,
+  ): Promise<LandFile[]> {
+    const byPath = new Map<string, LandFile>();
+    for (const f of await this.deps.git.numstatFiles(projectPath, base, branch)) byPath.set(f.path, { ...f });
+    const patch = await this.deps.git.diffWithUntracked(lanePath, 'HEAD').catch(() => '');
+    for (const f of statsOf(patch)) {
+      const seen = byPath.get(f.path);
+      if (seen === undefined) byPath.set(f.path, { ...f });
+      else
+        byPath.set(f.path, { path: f.path, added: seen.added + f.added, removed: seen.removed + f.removed });
+    }
+    return [...byPath.values()]
+      .filter((f) => !isSecretFile(f.path))
+      .sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  private async remoteOf(projectPath: string): Promise<string | null> {
+    const remotes = await this.deps.git.remotes(projectPath).catch(() => []);
+    return (remotes.find((r) => r.name === 'origin') ?? remotes[0])?.name ?? null;
+  }
+
+  private patch(worktreeId: string, fn: (w: Worktree) => Worktree): void {
+    const current = this.deps.repos.worktrees.get(worktreeId);
+    if (current === null) return;
+    this.deps.repos.worktrees.upsert(fn(current));
+    this.deps.publisher.upsert('worktrees', [worktreeId]);
+  }
+}

@@ -1,0 +1,324 @@
+@layer screens {
+  .pane {
+    width: var(--w-chat);
+    flex: none;
+    position: relative;
+    border-left: 1px solid var(--ln);
+    background: var(--s1);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    min-width: 0;
+  }
+  /* Pop-out window: the pane is the whole window (no left hairline, no fixed width). */
+  .compact {
+    width: auto;
+    flex: 1;
+    border-left: 0;
+  }
+  .tabsRow {
+    height: var(--h-tabrow);
+    flex: none;
+    border-bottom: 1px solid var(--ln);
+    display: flex;
+    align-items: stretch;
+    min-width: 0;
+  }
+  .tabs {
+    border-bottom: 0;
+    height: auto;
+    /* The tab strip gives way (and scrolls inside itself) before it pushes + and ⤢ out of the 360px pane: with
+       three tabs plus the +N overflow the row grew past the pane and the whole shell could be scrolled sideways. */
+    flex: 1 1 auto;
+    min-width: 0;
+  }
+  .overflow {
+    position: relative;
+    display: flex;
+  }
+  .menu {
+    position: absolute;
+    top: 100%;
+    left: 0;
+    z-index: 2;
+    min-width: 160px;
+    background: var(--s1);
+    border: 1px solid var(--tx);
+    display: flex;
+    flex-direction: column;
+  }
+  .menuItem {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px 12px;
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--tx);
+    white-space: nowrap;
+  }
+  .menuItem:hover {
+    background: var(--s2);
+  }
+  .menuItem:disabled {
+    color: var(--mu);
+    cursor: default;
+  }
+  .menuItem:disabled:hover {
+    background: transparent;
+  }
+  .menuSep {
+    height: 1px;
+    background: var(--ln);
+  }
+  .badge {
+    background: var(--ac);
+    color: var(--acx);
+    font-size: 9px;
+    font-weight: 700;
+    padding: 0 4px;
+  }
+  .plus {
+    padding: 0 12px;
+    display: flex;
+    align-items: center;
+    color: var(--mu);
+    font-size: 16px;
+    cursor: pointer;
+  }
+  .spacer {
+    flex: 1;
+  }
+  /* Prototype: 12px padding around a 13px text ⤢ = 32px box; the SVG icon keeps that width. */
+  .popout {
+    width: 32px;
+    padding: 0;
+    border-left: 1px solid var(--ln);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--mu);
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .popout:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  /* Meta line, and at its right end the Snake button (owner addition, discrepancy row 110). */
+  .metaRow {
+    flex: none;
+    display: flex;
+    align-items: stretch;
+    border-bottom: 1px solid var(--ln);
+  }
+  .meta {
+    flex: 1;
+    min-width: 0;
+    padding: 8px 14px;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--mu);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .arcadeButton {
+    flex: none;
+    padding: 0 12px;
+    border-left: 1px solid var(--ln);
+    font-size: 12px;
+    font-weight: 600;
+    color: var(--mu);
+  }
+  .arcadeButton:hover {
+    color: var(--tx);
+  }
+  .arcadeButton:disabled {
+    opacity: 0.5;
+    cursor: default;
+  }
+  /* Prototype bubbles inherit the transcript's 1.5 leading. */
+  .pane [data-kind='user'] {
+    line-height: 1.5;
+  }
+  /* Prototype hint row: 10px labels at normal leading (the shared Composer squeezes them to 1). */
+  .pane textarea + div,
+  .pane textarea {
+    line-height: normal;
+  }
+  .code {
+    font-family: var(--font-mono);
+    font-size: 12px;
+  }
+  /* Session controls (discrepancy #54): t-label selects replace the @file / command hints on the hint line, no box.
+     Effort lives in the spawn modal and Settings (it only applies at the next launch), so the line fits 360px. */
+  .control {
+    flex: none;
+    min-width: 0;
+    margin: 0;
+    padding: 0;
+  }
+  .control select {
+    height: auto;
+    /* Hug the selected label (Chromium supports field-sizing on selects); otherwise the longest option sets the width. */
+    field-sizing: content;
+    padding: 0 12px 0 0;
+    border: 0;
+    background: transparent;
+    font-size: 12px;
+    font-weight: 600;
+    line-height: normal;
+    color: var(--mu);
+  }
+  .control select:hover {
+    color: var(--tx);
+  }
+  .control svg {
+    right: 0;
+    width: 8px;
+    height: 8px;
+    margin-top: -4px;
+  }
+  .stop {
+    flex: none;
+    padding: 0;
+    border: 0;
+    line-height: normal;
+    white-space: nowrap;
+  }
+  .popped {
+    flex: 1;
+    min-height: 0;
+    display: flex;
+    flex-direction: column;
+    align-items: flex-start;
+    gap: 10px;
+    padding: 14px;
+  }
+}
+
+@layer components {
+  /* Drag handle on the chat's left edge, the terminal's 6px handle turned 90°. Sits over the 1px border so the
+     pane itself does not shift. Hidden in the pop-out, which is its own window. */
+  .resize {
+    position: absolute;
+    top: 0;
+    bottom: 0;
+    left: -3px;
+    width: 6px;
+    cursor: ew-resize;
+    z-index: 1;
+  }
+  .resize:focus-visible {
+    outline: 1px solid var(--tx);
+    outline-offset: -1px;
+  }
+}
+
+@layer components {
+  /* A message from another agent. Bordered and labelled with its sender, never a user bubble: the reader must
+     be able to tell at a glance that these words are not theirs and not this agent's. */
+  .peer {
+    max-width: 92%;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 8px 10px;
+    border: 1px dashed var(--ln);
+    background: var(--s1);
+    font-size: 13px;
+    line-height: 1.5;
+    user-select: text;
+  }
+  .peer[data-peer='out'] {
+    align-self: flex-end;
+    opacity: 0.75;
+  }
+  .peerHead {
+    color: var(--mu);
+  }
+}
+
+@layer components {
+  /* A message held while the agent is mid-turn: where the user bubble will be, dashed until it goes out. */
+  .queued {
+    align-self: flex-end;
+    max-width: 88%;
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    padding: 8px 10px;
+    border: 1px dashed var(--ln);
+    color: var(--tx);
+    line-height: 1.45;
+    user-select: text;
+  }
+  .queuedBody {
+    white-space: pre-wrap;
+  }
+  .queuedMeta {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    min-width: 0;
+  }
+  .queuedLabel {
+    flex: 1;
+    min-width: 0;
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--mu);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .queuedAction {
+    flex: none;
+    padding: 0;
+    border: 0;
+    line-height: normal;
+    white-space: nowrap;
+  }
+  /* ADR-0027 §3: "3 earlier turns · Show them" above the receipts. */
+  .earlier {
+    display: flex;
+    align-items: baseline;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--mu);
+  }
+  .link {
+    padding: 0;
+    border: 0;
+    background: transparent;
+    color: var(--mu);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    text-decoration: underline;
+    text-underline-offset: 3px;
+    cursor: pointer;
+  }
+  .link:hover {
+    color: var(--tx);
+  }
+  .earlierToggle {
+    margin-left: auto;
+    padding: 2px 8px;
+    border: 1px solid var(--ln);
+    background: transparent;
+    color: var(--tx);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .earlierToggle:hover {
+    background: var(--s2);
+  }
+  /* No lane yet: the pane offers a new task instead of a header. */
+  .noLane {
+    flex: none;
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--ln);
+  }
+}

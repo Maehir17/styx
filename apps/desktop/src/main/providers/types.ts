@@ -1,0 +1,323 @@
+import type { CredentialVault } from '../services/credential-vault';
+import type { CliRunner } from './cli-runner';
+
+export type Provider =
+  'vercel' | 'aws' | 'gcp' | 'supabase' | 'github' | 'ssh' | 'fly' | 'railway' | 'render';
+export type Scope = 'read' | 'write' | 'deploy' | 'delete';
+export type Env = 'prod' | 'staging' | 'preview' | 'scm';
+
+export interface TargetInfo {
+  id: string;
+  provider: Provider;
+  name: string;
+  env: Env;
+  config: Record<string, unknown>;
+  credentialRef: string | null;
+}
+
+export interface GrantInfo {
+  id: string;
+  scope: Scope[];
+  duration: 'once' | '1h' | 'session' | 'always';
+  expiresAt: number | null;
+}
+
+export type ConnectInput =
+  | { method: 'token'; token: string; name?: string; config?: Record<string, unknown> }
+  /**
+   * Reuse the login the provider's own CLI holds (`gcloud auth list` account, `aws` profile, `gh` login, the
+   * `vercel` / `supabase` CLI token). Nothing secret is stored: the vault entry names the account and the CLI
+   * mints on every grant.
+   */
+  | { method: 'cli'; account: string; name?: string; config?: Record<string, unknown> }
+  | {
+      method: 'device';
+      onCode: (code: { userCode: string; verificationUri: string }) => void;
+      abort?: AbortSignal;
+    }
+  | {
+      method: 'key';
+      accessKeyId: string;
+      secretAccessKey: string;
+      region?: string;
+      roleArn?: string;
+      name?: string;
+    }
+  | { method: 'service-account'; json: string; projectId?: string }
+  | { method: 'ssh'; host: string; user: string; keyPath: string; port?: number; passphrase?: string };
+
+export type IssuedCredential =
+  | { kind: 'env'; env: Record<string, string>; expiresAt: number | null; scoped: boolean; handle?: string }
+  | {
+      kind: 'ssh-agent';
+      socketPath: string;
+      env: Record<string, string>;
+      expiresAt: number | null;
+      scoped: boolean;
+      handle: string;
+    };
+
+/**
+ * `needsProject`: the credential works but the target does not say which of the account's projects it acts on (or
+ * names one the account no longer has). Not an expiry: the row keeps its health and offers the project picker.
+ */
+export type TestResult =
+  { ok: true; identity: string } | { ok: false; error: string; needsProject?: boolean };
+
+/** One project a credential can reach (`target.connect.projects`); ids only, never secrets. */
+export interface ProviderProject {
+  id: string;
+  name: string;
+  region: string | null;
+}
+
+/** Whose login lists the projects: a pasted token (not saved yet), the CLI login, or a saved target's credential. */
+export type ProjectSource =
+  | { kind: 'token'; token: string }
+  | { kind: 'cli'; account: string }
+  | { kind: 'target'; target: TargetInfo };
+
+/**
+ * Periodic health probe (RefreshScheduler). `expired: true` means minting actually failed for an auth reason
+ * (SSO session over, token revoked, CLI logged out) and the target should show the auth-expired banner;
+ * `expired: false` is transient (CLI missing, timeout, network) and leaves the row alone.
+ */
+export type HealthResult = { ok: true; identity: string } | { ok: false; expired: boolean; error: string };
+
+/** What the provider's CLI currently knows (`target.connect.cliStatus`); identities only, never tokens. */
+export interface CliStatus {
+  installed: boolean;
+  binary: string | null;
+  version: string | null;
+  loginCommand: string;
+  accounts: { id: string; label: string; active: boolean; detail?: string }[];
+}
+
+/** A login command Styx runs in a terminal the user can see (`target.connect.cliLogin`). */
+export interface CliCommand {
+  bin: string;
+  args: string[];
+  env?: Record<string, string>;
+}
+
+export interface ProviderAdapter {
+  readonly provider: Provider;
+  /** The Advanced (non-CLI) method this adapter's `connect` accepts; `cli` mode is available when `cliStatus` exists. */
+  readonly authMethod: 'oauth' | 'key' | 'ssh';
+  /** Stores the secret in the vault; returns the ref plus non-secret config and a display label. */
+  connect(
+    input: ConnectInput,
+    targetId: string,
+  ): Promise<{ credentialRef: string; config: Record<string, unknown>; label: string }>;
+  test(target: TargetInfo): Promise<TestResult>;
+  /** Scoped short-lived credential where the provider supports it, else the stored token as env (scoped: false). */
+  issue(grant: GrantInfo, target: TargetInfo): Promise<IssuedCredential>;
+  revoke(issued: IssuedCredential): Promise<void>;
+  /**
+   * Maps a shim invocation to the scopes it needs (spec: "Styx enforces scope at the command level"). `tool` is the
+   * shim binary that was invoked (`ssh` vs `scp`/`rsync`, `aws` vs `sam`); adapters with one tool may ignore it.
+   */
+  scopeOfCommand(argv: string[], tool?: string): Scope[];
+  /**
+   * Whether `issue` for these scopes yields a credential narrower than the stored one. Absent = unscoped (fail
+   * closed): GrantService.approve then forces MFA on prod regardless of the classified scope, because the agent
+   * receives the full token no matter what the shim heuristics decided.
+   */
+  issuesScoped?(scope: readonly Scope[], target?: Pick<TargetInfo, 'credentialRef' | 'config'>): boolean;
+  /**
+   * Which environment a shim command acts on, when the provider's CLI says so without a `--prod` flag (Vercel: a
+   * deploy without `--prod` is a preview). Absent or null = unknown, and the broker then treats the command as
+   * production when the project has a production target (fail closed): many CLIs (supabase, aws, gcloud) carry no
+   * environment in argv, and their credentials often can't be narrowed to one target.
+   */
+  envOfCommand?(argv: string[], tool?: string): 'prod' | 'non-prod' | null;
+  /** Which shim binaries route to this provider. */
+  readonly tools: string[];
+  /** CLI-first connect: what the local CLI knows (installed, version, accounts). Absent = no CLI mode (SSH). */
+  cliStatus?(): Promise<CliStatus>;
+  /** The CLI's own login flow for `account` (or a fresh login when omitted); runs in a visible terminal. */
+  cliLoginCommand?(account?: string): CliCommand;
+  /**
+   * The argv that deploys this target. Named by the adapter rather than hard-coded in a service, since only the
+   * provider knows how its own environments map onto flags (`--prod` vs a preview build).
+   */
+  deployCommand?(target: TargetInfo): CliCommand;
+  /** Health probe that distinguishes auth expiry from transient failure; falls back to `test()` when absent. */
+  health?(target: TargetInfo): Promise<HealthResult>;
+  /**
+   * Providers whose login reaches several projects (Supabase): the `config` key that names the one a target acts on,
+   * and the projects to choose from. Present together; a target must never fall back to "the first project".
+   */
+  readonly projectKey?: string;
+  /**
+   * The project a shim command names through the CLI's own flag (`fly … --app acme-staging`), for providers whose
+   * write credential only works on that project (a Fly.io deploy token on one app). The broker then routes a
+   * non-read command to the target with that project: the token it gets can't reach any other. Absent for
+   * account-wide credentials (Render), where naming a project proves nothing.
+   */
+  projectOfCommand?(argv: string[]): string | null;
+  listProjects?(source: ProjectSource): Promise<ProviderProject[]>;
+}
+
+export type Fetch = typeof fetch;
+
+export interface AdapterDeps {
+  vault: CredentialVault;
+  fetch: Fetch;
+  now: () => number;
+  /** Runs provider CLIs on the login-shell PATH; output is never logged. */
+  cli: CliRunner;
+}
+
+export const HOUR = 3_600_000;
+
+export function expiryFor(grant: GrantInfo, now: number, providerMax = HOUR): number | null {
+  if (grant.duration === 'always' || grant.duration === 'session') return grant.expiresAt ?? null;
+  const want = grant.expiresAt ?? now + HOUR;
+  return Math.min(want, now + providerMax);
+}
+
+export function hasVerb(argv: string[], verbs: RegExp): boolean {
+  return argv.some((a) => verbs.test(a));
+}
+
+/**
+ * The command words of an invocation: leading global flags (`--profile x`, `--region=y`) are skipped, then tokens up
+ * to the first flag. Read/write classification only ever looks at these, never at flag values, so
+ * `aws ssm put-parameter --name list-foo` cannot pass as a read (M2).
+ */
+export function commandHead(argv: string[]): string[] {
+  let i = 0;
+  while (i < argv.length && (argv[i] ?? '').startsWith('-'))
+    i += (argv[i] ?? '').includes('=') || (argv[i + 1] ?? '-').startsWith('-') ? 1 : 2;
+  const head: string[] = [];
+  for (; i < argv.length; i += 1) {
+    const a = argv[i] ?? '';
+    if (a.startsWith('-')) break;
+    head.push(a);
+  }
+  return head;
+}
+
+/** `--help` / `--version` / `help` anywhere in argv: no remote effect. */
+export function isHelp(argv: string[]): boolean {
+  return (
+    argv.length === 0 ||
+    argv.some((a) => a === '--help' || a === '-h' || a === '--version' || a === '-v') ||
+    argv[0] === 'help' ||
+    argv[0] === 'version'
+  );
+}
+
+/**
+ * Walks a single-dash short-option cluster (`-iX`, `-sXDELETE`, `-if title=x`, `-Fname=@x`) the way pflag/getopt do:
+ * every letter is a flag until a value-taking one (`takesValue`) is hit, whose value is the rest of the arg or, when
+ * empty, the next argv token. Returns the value-taking letters seen and the value of the last one. Unknown letters
+ * are stepped over so a flag hidden behind a boolean (`-iX`) is never missed (fail closed).
+ */
+export function shortFlags(
+  arg: string,
+  next: string | undefined,
+  takesValue: string,
+): { flags: string[]; value: string | null; consumedNext: boolean } {
+  if (!/^-[^-]/.test(arg)) return { flags: [], value: null, consumedNext: false };
+  const flags: string[] = [];
+  for (let i = 1; i < arg.length; i += 1) {
+    const c = arg[i] ?? '';
+    if (takesValue.includes(c)) {
+      flags.push(c);
+      const rest = arg.slice(i + 1);
+      if (rest !== '') return { flags, value: rest, consumedNext: false };
+      return { flags, value: next ?? '', consumedNext: next !== undefined };
+    }
+    flags.push(c);
+  }
+  return { flags, value: null, consumedNext: false };
+}
+
+/**
+ * A help or version request, read strictly (for providers whose classifier must not be steered by a stray flag):
+ * a bare invocation, `help …` / `version`, a lone `--version`, or `--help` / `-h` as the last argument when nothing
+ * before it is `--` and the word before it is not a flag (`--name --help` hands `--help` to `--name` as its value).
+ * Unlike `isHelp`, a `-v` or `-h` in the middle (`railway add -v K=V`, psql's `-h host`) is never help.
+ */
+export function strictHelp(argv: readonly string[]): boolean {
+  if (argv.length === 0) return true;
+  const [first] = argv;
+  if (
+    first === 'help' ||
+    (argv.length === 1 && (first === 'version' || first === '--version' || first === '-V'))
+  )
+    return true;
+  if (argv.includes('--')) return false;
+  const last = argv.at(-1);
+  if (last !== '--help' && last !== '-h') return false;
+  const prev = argv.length > 1 ? (argv.at(-2) ?? '') : '';
+  return !prev.startsWith('-');
+}
+
+/**
+ * The command words under both readings of leading flags: `--json up logs` is `up logs` when `--json` is a boolean,
+ * and `logs` when it takes a value. Classifiers judge every reading and keep the widest (`widestScope`), so a
+ * boolean flag in front can't turn `up` into a read.
+ */
+export function commandHeads(argv: readonly string[]): string[][] {
+  const valued = commandHead([...argv]);
+  let i = 0;
+  while (i < argv.length && (argv[i] ?? '').startsWith('-')) i += 1;
+  const boolean: string[] = [];
+  for (; i < argv.length; i += 1) {
+    const a = argv[i] ?? '';
+    if (a.startsWith('-')) break;
+    boolean.push(a);
+  }
+  return valued.join('\u0000') === boolean.join('\u0000') ? [valued] : [valued, boolean];
+}
+
+const SCOPE_RANK: Record<Scope, number> = { read: 0, write: 1, deploy: 2, delete: 3 };
+
+/** The widest of several classifications (delete > deploy > write > read). */
+export function widestScope(scopes: readonly Scope[]): Scope[] {
+  let top: Scope = 'read';
+  for (const s of scopes) if (SCOPE_RANK[s] > SCOPE_RANK[top]) top = s;
+  return [top];
+}
+
+/**
+ * Every command word in argv, under both readings of flags anywhere (each flag takes the next word, or none):
+ * `fly machine --app x destroy id` is `machine destroy id`. Classifiers use these only to escalate (a delete or a
+ * deploy found here wins), never to downgrade, since a flag's value can read as anything.
+ */
+export function wordReadings(argv: readonly string[]): string[][] {
+  const end = argv.indexOf('--');
+  const words = end === -1 ? argv : argv.slice(0, end);
+  const valued: string[] = [];
+  for (let i = 0; i < words.length; i += 1) {
+    const a = words[i] ?? '';
+    if (a.startsWith('-')) {
+      if (!a.includes('=') && !(words[i + 1] ?? '-').startsWith('-')) i += 1;
+      continue;
+    }
+    valued.push(a);
+  }
+  const all = words.filter((a) => !a.startsWith('-'));
+  // Each later word on its own after the first (`machine … destroy`, `secrets … unset`), and after the first two
+  // (`environment … delete`): a mix of valued and boolean flags in between can't hide a verb then.
+  const [first, second] = all;
+  const singles =
+    first === undefined
+      ? []
+      : all
+          .slice(1)
+          .flatMap((w, i) => [[first, w], ...(second !== undefined && i > 0 ? [[first, second, w]] : [])]);
+  return [valued, all, ...singles];
+}
+
+/** `widestScope` of the command-word readings, escalated by a delete or deploy found anywhere (`wordReadings`). */
+export function classifyArgv(argv: readonly string[], classify: (head: string[]) => Scope): Scope[] {
+  const base = commandHeads(argv).map(classify);
+  const escalations = wordReadings(argv)
+    .map(classify)
+    .filter((s) => s === 'delete' || s === 'deploy');
+  return widestScope([...base, ...escalations]);
+}

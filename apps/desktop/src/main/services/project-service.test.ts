@@ -1,0 +1,1422 @@
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, sep } from 'node:path';
+import {
+  DEFAULT_PROJECT_SETTINGS,
+  MACHINE_PROJECT_SETTINGS,
+  fixtures,
+  isMachineProjectSetting,
+  parseProjectFile,
+  projectSettingsFromFile,
+  projectSettingsSchema,
+  type ProjectFileV1,
+  type ProjectSettings,
+  copy,
+} from '@styx/core';
+import { describe, expect, it } from 'vitest';
+import { makeTestApp } from '../test-support';
+import { ExecaGitRunner, GitService } from './git';
+import type { RecentFolder } from './ide-import-service';
+import {
+  HOME_DEPTH,
+  HOME_SKIP_DIRS,
+  ProjectService,
+  ROOT_DEPTH,
+  STALE_MS,
+  advisoryRules,
+  applySettingsToFile,
+  byLastActivity,
+  fileSettings,
+  isSuggested,
+  isTransientPath,
+  mergeCandidates,
+  policyDiff,
+  policyHashOf,
+  policySummaryOf,
+  projectFileRules,
+  scanRoots,
+  walkForRepos,
+  githubHtmlUrl,
+  remoteUrlOf,
+} from './project-service';
+
+const { ids } = fixtures;
+const NOW = fixtures.DEMO_NOW;
+const DAY = 24 * 3_600_000;
+
+describe('project.scan merge + suggestion logic', () => {
+  it.each([
+    ['remote + fresh', 'git@github.com:a/b.git', NOW - DAY, true],
+    ['remote + stale', 'git@github.com:a/b.git', NOW - STALE_MS - DAY, true],
+    ['no remote + fresh', null, NOW - 30 * DAY, true],
+    ['no remote + stale (> 1 year)', null, NOW - STALE_MS - DAY, false],
+    ['no remote + unknown mtime', null, null, false],
+    ['no remote + exactly a year', null, NOW - STALE_MS, true],
+  ])('%s → suggested=%s', (_label, remote, mtime, expected) => {
+    expect(isSuggested(remote, mtime, NOW)).toBe(expected);
+  });
+
+  it('merges filesystem hits, IDE recents and agent history; first-listed source wins on overlap, known paths drop, sorted by path', () => {
+    const known = new Set(['/h/code/known']);
+    expect(
+      mergeCandidates(
+        ['/h/code/zeta', '/h/code/alpha', '/h/code/known'],
+        ['/h/work/ide-only', '/h/code/alpha', '/h/code/known'],
+        [
+          { path: '/h/code/alpha', source: 'claude' },
+          { path: '/h/work/ide-only', source: 'codex' },
+          { path: '/h/agent-only', source: 'codex' },
+          { path: '/h/code/known', source: 'claude' },
+        ],
+        known,
+      ),
+    ).toEqual([
+      { path: '/h/agent-only', source: 'codex' },
+      { path: '/h/code/alpha', source: 'scan' },
+      { path: '/h/code/zeta', source: 'scan' },
+      { path: '/h/work/ide-only', source: 'ide-recent' },
+    ]);
+    expect(mergeCandidates([], [], [], known)).toEqual([]);
+  });
+
+  it('isTransientPath: the home, .styx worktrees and OS temp scratch dirs are never candidates', () => {
+    // The service splits on the host separator: spell the POSIX fixtures with it, so a Windows host checks the same.
+    const h = (p: string) => p.split('/').join(sep);
+    const home = h('/Users/me');
+    expect(isTransientPath(home, home, h('/tmp'))).toBe(true);
+    expect(isTransientPath(h('/Users/me/.styx/worktrees/app/agent-claude-1'), home, h('/tmp'))).toBe(true);
+    expect(isTransientPath(h('/Users/me/code/app/.styx/worktrees/lane'), home, h('/tmp'))).toBe(true);
+    expect(isTransientPath(h('/tmp/claude-501/scratchpad'), home, h('/tmp'))).toBe(true);
+    expect(isTransientPath(h('/tmp/claude-501/scratchpad'), home, h('/tmp/'))).toBe(true);
+    expect(isTransientPath(h('/Users/me/code/app'), home, h('/tmp'))).toBe(false);
+    expect(isTransientPath(h('/Users/me/.styxy/app'), home, h('/tmp'))).toBe(false);
+    expect(isTransientPath(h('/tmpfs/app'), home, h('/tmp'))).toBe(false);
+    // A home under the temp dir (tests) keeps its own folders.
+    expect(isTransientPath(h('/tmp/home-x/code/app'), h('/tmp/home-x'), h('/tmp'))).toBe(false);
+  });
+});
+
+const DAY_MS = 24 * 3_600_000;
+const writeAt = (file: string, text: string, mtime: number): void => {
+  mkdirSync(join(file, '..'), { recursive: true });
+  writeFileSync(file, text);
+  utimesSync(file, new Date(mtime), new Date(mtime));
+};
+/** A Claude Code session under an encoded name that never matches the cwd it records. */
+const claudeSession = (home: string, n: number, cwd: string, mtime: number): void =>
+  writeAt(
+    join(home, '.claude', 'projects', `-enc-${n}`, 's.jsonl'),
+    JSON.stringify({ type: 'queue-operation' }) + '\n' + JSON.stringify({ cwd, type: 'user' }) + '\n',
+    mtime,
+  );
+const codexSession = (home: string, n: number, cwd: string, mtime: number): void =>
+  writeAt(
+    join(home, '.codex', 'sessions', '2026', '09', '10', `rollout-${n}.jsonl`),
+    JSON.stringify({ type: 'session_meta', payload: { cwd } }) + '\n',
+    mtime,
+  );
+
+/** `home/<rel>` as a repo: a `.git` dir, or a `.git` file for worktrees. */
+const repoAt = (home: string, rel: string, worktree = false): string => {
+  const dir = join(home, ...rel.split('/'));
+  mkdirSync(dir, { recursive: true });
+  if (worktree) writeFileSync(join(dir, '.git'), 'gitdir: /elsewhere/.git/worktrees/x\n');
+  else mkdirSync(join(dir, '.git'));
+  return dir;
+};
+
+describe('walkForRepos (project.scan roots, skips, budget)', () => {
+  it('finds repos under the code roots (depth 3), $HOME (depth 2) and the extra roots; skips system dirs, dot-dirs, node_modules, nested repos', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    const found = [
+      repoAt(home, 'code/alpha'),
+      repoAt(home, 'code/org/team/beta'), // depth 3 under ~/code
+      repoAt(home, 'AmrodOrders'), // directly under $HOME
+      repoAt(home, 'clients/c21'), // depth 2 under $HOME
+      repoAt(home, 'Desktop/scratch/gmaps-scraper'),
+      repoAt(home, 'Documents/a/b/deep'), // depth 3 under ~/Documents
+      repoAt(home, 'Downloads/wt', true), // worktree: `.git` is a file
+    ];
+    const hidden = [
+      repoAt(home, 'code/alpha/vendor-sub'), // inside a repo: never descended into
+      repoAt(home, 'too/deep/for/home'), // depth 4 under $HOME, not under a root
+      repoAt(home, 'Documents/a/b/c/toodeep'), // depth 4 under ~/Documents
+      repoAt(home, 'Library/Caches/lib-repo'),
+      repoAt(home, 'Applications/app-repo'),
+      repoAt(home, '.Trash/gone'),
+      repoAt(home, '.config/dotrepo'),
+      repoAt(home, 'node_modules/dep'),
+      repoAt(home, 'Desktop/node_modules/dep2'),
+      repoAt(home, 'Music/mix'),
+    ];
+    const r = await walkForRepos(scanRoots(home, 'darwin'));
+    expect(r.truncated).toBe(false);
+    expect([...r.repos].sort()).toEqual([...found].sort());
+    for (const h of hidden) expect(r.repos).not.toContain(h);
+    // The extra roots are walked at ROOT_DEPTH and `$HOME` last at HOME_DEPTH with its skip list.
+    const roots = scanRoots(home, 'darwin');
+    expect(roots.at(-1)).toEqual({ path: home, depth: HOME_DEPTH, skip: HOME_SKIP_DIRS });
+    expect(roots.find((x) => x.path === join(home, 'Desktop'))?.depth).toBe(ROOT_DEPTH);
+    expect(roots.some((x) => x.path === 'C:\\dev')).toBe(false);
+    expect(scanRoots(home, 'win32').some((x) => x.path === 'C:\\dev')).toBe(true);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('missing roots are skipped, symlinked dirs are not followed, and each root is walked once', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    const a = repoAt(home, 'code/a');
+    const { symlinkSync } = await import('node:fs');
+    mkdirSync(join(home, 'Desktop'));
+    symlinkSync(join(home, 'code'), join(home, 'Desktop', 'code-link'));
+    const r = await walkForRepos([
+      { path: join(home, 'nope'), depth: 3 },
+      { path: join(home, 'code'), depth: 3 },
+      { path: home, depth: 2 },
+    ]);
+    expect(r.repos).toEqual([a]);
+    // home, code, a (repo, counted), Desktop — the symlink is skipped and ~/code is not re-walked from $HOME.
+    expect(r.visited).toBe(4);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('stops at the directory budget and at the time budget, reporting truncation', async () => {
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    for (let i = 0; i < 6; i++) repoAt(home, `code/r${i}`);
+    const byDirs = await walkForRepos([{ path: join(home, 'code'), depth: 3 }], { maxDirs: 3 });
+    expect(byDirs.truncated).toBe(true);
+    expect(byDirs.visited).toBe(3);
+    expect(byDirs.repos.length).toBe(2);
+    let tick = 0;
+    const byTime = await walkForRepos(
+      [{ path: join(home, 'code'), depth: 3 }],
+      { maxMs: 5 },
+      () => (tick += 4),
+    );
+    expect(byTime.truncated).toBe(true);
+    expect(byTime.repos.length).toBeLessThan(6);
+    const full = await walkForRepos([{ path: join(home, 'code'), depth: 3 }]);
+    expect(full.truncated).toBe(false);
+    expect(full.repos.length).toBe(6);
+    rmSync(home, { recursive: true, force: true });
+  });
+});
+
+describe('ProjectService.scan / clone', () => {
+  const service = (t: ReturnType<typeof makeTestApp>, home: string, ideRecents: RecentFolder[] = []) =>
+    new ProjectService({
+      repos: t.app.repos,
+      publisher: t.app.publisher,
+      clock: t.clock,
+      git: t.app.git,
+      platform: 'darwin',
+      home,
+      env: {},
+      templatesDir: null,
+      ideRecents: async () => ideRecents,
+    });
+
+  it('scan merges IDE recents without ide.import, drops known projects, sorts git first then by last activity desc', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    const older = repoAt(home, 'code/older');
+    const newer = repoAt(home, 'STYX');
+    const recent = repoAt(home, 'elsewhere/from-ide'); // only reachable through IDE recents (depth 2 → it is, so use depth 3)
+    const ideOnly = repoAt(home, 'x/y/z/ide-only');
+    const known = repoAt(home, 'code/known');
+    utimesSync(join(older, '.git'), new Date(NOW - 10 * DAY), new Date(NOW - 10 * DAY));
+    utimesSync(join(newer, '.git'), new Date(NOW - DAY), new Date(NOW - DAY));
+    utimesSync(join(recent, '.git'), new Date(NOW - 3 * DAY), new Date(NOW - 3 * DAY));
+    utimesSync(join(ideOnly, '.git'), new Date(NOW - 2 * DAY), new Date(NOW - 2 * DAY));
+    utimesSync(join(known, '.git'), new Date(NOW), new Date(NOW));
+    t.app.repos.projects.upsert({
+      ...fixtures.demoFixture().projects[0]!,
+      id: 'known' as never,
+      path: known,
+    });
+    // A folder the IDE opened (no `.git`) is listed as-is with `hasGit: false`, dated by when it was opened; a path
+    // that does not exist is dropped.
+    const plain = join(home, 'notes');
+    mkdirSync(plain);
+    const svc = service(t, home, [
+      { path: ideOnly, openedAt: null },
+      { path: plain, openedAt: NOW - 5 * DAY },
+      { path: join(home, 'gone'), openedAt: NOW },
+    ]);
+    const rows = await svc.scan(true);
+    expect(rows.map((r) => [r.path, r.source, r.hasGit])).toEqual([
+      [newer, 'scan', true],
+      [ideOnly, 'ide-recent', true],
+      [recent, 'scan', true],
+      [older, 'scan', true],
+      [plain, 'ide-recent', false],
+    ]);
+    expect(rows.find((r) => r.path === plain)).toMatchObject({
+      remote: null,
+      branch: null,
+      lastModifiedAt: NOW - 5 * DAY,
+      suggested: true,
+    });
+    expect((await svc.scan(false)).map((r) => r.path)).toEqual([newer, recent, older]);
+    expect(
+      [
+        { path: 'b', lastModifiedAt: null },
+        { path: 'a', lastModifiedAt: 1 },
+        { path: 'c', lastModifiedAt: 2 },
+        { path: 'a2', lastModifiedAt: null },
+      ]
+        .map((x) => ({
+          ...x,
+          remote: null,
+          branch: null,
+          hasGit: true,
+          source: 'scan' as const,
+          suggested: true,
+        }))
+        .sort(byLastActivity)
+        .map((x) => x.path),
+    ).toEqual(['c', 'a', 'a2', 'b']);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('scan adds where Claude Code and Codex worked: first-listed source, max activity, real git check, exclusions', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    const scratch = mkdtempSync(join(tmpdir(), 'styx-scratch-'));
+    // Found by the walker and by Claude Code: the walker's row, dated by the newer of `.git` and the session.
+    const both = repoAt(home, 'code/both');
+    utimesSync(join(both, '.git'), new Date(NOW - 10 * DAY_MS), new Date(NOW - 10 * DAY_MS));
+    claudeSession(home, 1, both, NOW - DAY_MS);
+    // Past the walker's depth: only the agents know these.
+    const claudeRepo = repoAt(home, 'deep/a/b/claude-repo');
+    utimesSync(join(claudeRepo, '.git'), new Date(NOW - 20 * DAY_MS), new Date(NOW - 20 * DAY_MS));
+    claudeSession(home, 2, claudeRepo, NOW - 4 * DAY_MS);
+    const codexPlain = join(home, 'deep', 'a', 'b', 'notes');
+    mkdirSync(codexPlain, { recursive: true });
+    codexSession(home, 1, codexPlain, NOW - 6 * DAY_MS);
+    // The IDE opened it, Codex ran in it later: the IDE's row, the later date.
+    const ideAndCodex = join(home, 'deep', 'a', 'b', 'ide-plain');
+    mkdirSync(ideAndCodex, { recursive: true });
+    codexSession(home, 2, ideAndCodex, NOW - 3 * DAY_MS);
+    // A folder inside a real repo (the CLI was started there): the real git check says repo, no `.git` entry to date it.
+    const real = join(home, 'deep', 'a', 'b', 'real');
+    mkdirSync(real, { recursive: true });
+    await t.app.git.init(real);
+    const inRepo = join(real, 'packages', 'web');
+    mkdirSync(inRepo, { recursive: true });
+    claudeSession(home, 3, inRepo, NOW - 2 * DAY_MS);
+    // Never candidates: the home, Styx's own worktrees, temp scratch dirs, a known project and its worktrees, gone dirs.
+    claudeSession(home, 4, home, NOW);
+    const styxLane = join(home, '.styx', 'worktrees', 'app', 'agent-claude-1');
+    mkdirSync(styxLane, { recursive: true });
+    claudeSession(home, 5, styxLane, NOW);
+    claudeSession(home, 6, scratch, NOW);
+    claudeSession(home, 7, join(home, 'gone'), NOW);
+    const svc = service(t, home, [{ path: ideAndCodex, openedAt: NOW - 5 * DAY_MS }]);
+    const known = join(home, 'known');
+    mkdirSync(known);
+    const project = await svc.add(known);
+    const lane = join(home, 'lanes', 'agent-1');
+    mkdirSync(lane, { recursive: true });
+    const main = t.app.repos.worktrees.mainOf(project.id);
+    if (!main) throw new Error('main worktree missing');
+    t.app.repos.worktrees.upsert({ ...main, id: 'wt-lane' as never, isMain: false, path: lane });
+    codexSession(home, 3, known, NOW);
+    codexSession(home, 4, lane, NOW);
+
+    const rows = await svc.scan(true);
+    expect(rows.map((r) => [r.path, r.source, r.hasGit, r.lastModifiedAt])).toEqual([
+      [both, 'scan', true, NOW - DAY_MS],
+      [inRepo, 'claude', true, NOW - 2 * DAY_MS],
+      [claudeRepo, 'claude', true, NOW - 4 * DAY_MS],
+      [ideAndCodex, 'ide-recent', false, NOW - 3 * DAY_MS],
+      [codexPlain, 'codex', false, NOW - 6 * DAY_MS],
+    ]);
+    expect(rows.find((r) => r.path === inRepo)).toMatchObject({
+      remote: null,
+      branch: 'main',
+      suggested: true,
+    });
+    // Agent history off: the walker and the IDE only, dated by what they know.
+    expect((await svc.scan(true, false)).map((r) => [r.path, r.source, r.lastModifiedAt])).toEqual([
+      [both, 'scan', NOW - 10 * DAY_MS],
+      [ideAndCodex, 'ide-recent', NOW - 5 * DAY_MS],
+    ]);
+    rmSync(home, { recursive: true, force: true });
+    rmSync(scratch, { recursive: true, force: true });
+  });
+
+  it('clone reports cloning → done with the project id, adds the project, and refuses a non-empty destination', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    const src = join(home, 'src-repo');
+    mkdirSync(src);
+    await t.app.git.init(src);
+    writeFileSync(join(src, 'README.md'), '# hi\n');
+    await t.app.git.add(src, ['README.md']);
+    await t.app.git.commit(src, 'init');
+    const svc = service(t, home);
+    const project = await svc.clone(src, '~/code/cloned');
+    expect(project.path).toBe(join(home, 'code', 'cloned'));
+    expect(t.app.repos.projects.byPath(project.path)?.id).toBe(project.id);
+    t.app.publisher.flush();
+    expect(t.win.events('project.cloneProgress')).toEqual([
+      { url: src, dest: project.path, phase: 'cloning', message: null, projectId: null },
+      { url: src, dest: project.path, phase: 'done', message: null, projectId: project.id },
+    ]);
+    await expect(svc.clone(src, join(home, 'code', 'cloned'))).rejects.toThrow(/already exists/);
+    await expect(svc.clone(join(home, 'missing-src'), join(home, 'code', 'other'))).rejects.toThrow();
+    t.app.publisher.flush();
+    const phases = t.win.events('project.cloneProgress').map((e) => (e as { phase: string }).phase);
+    expect(phases).toEqual(['cloning', 'done', 'cloning', 'error', 'cloning', 'error']);
+    rmSync(home, { recursive: true, force: true });
+  });
+});
+
+describe('plain folders: add without git, gitInit upgrades', () => {
+  const service = (t: ReturnType<typeof makeTestApp>, home: string) =>
+    new ProjectService({
+      repos: t.app.repos,
+      publisher: t.app.publisher,
+      clock: t.clock,
+      git: t.app.git,
+      platform: 'darwin',
+      home,
+      templatesDir: null,
+      activity: t.app.activity,
+    });
+
+  it('add accepts any directory: a folder without .git gets a repo row with defaultBranch null and one main worktree on no branch', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    const folder = join(home, 'notes');
+    mkdirSync(folder);
+    writeFileSync(join(folder, 'todo.md'), '- ship\n');
+    const svc = service(t, home);
+    const project = await svc.add(folder);
+    expect(project).toMatchObject({ name: 'notes', path: folder, hasProjectFile: false });
+    const repo = t.app.repos.repos.byProject(project.id);
+    expect(repo).toMatchObject({ defaultBranch: null, remotes: [], ahead: 0, behind: 0 });
+    const main = t.app.repos.worktrees.mainOf(project.id);
+    expect(main).toMatchObject({
+      branch: null,
+      path: folder,
+      isMain: true,
+      owner: { kind: 'user' },
+      baseCommit: null,
+      headCommit: null,
+    });
+    expect(t.app.repos.worktrees.byProject(project.id)).toHaveLength(1);
+    // Adding the same folder again returns the existing project; a file is refused, a missing path is not found.
+    expect((await svc.add(folder)).id).toBe(project.id);
+    await expect(svc.add(join(folder, 'todo.md'))).rejects.toMatchObject({
+      code: 'invalid-input',
+      message: expect.stringContaining('is not a directory'),
+    });
+    await expect(svc.add(join(home, 'nope'))).rejects.toMatchObject({ code: 'not-found' });
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('gitInit runs git init -b main + an empty commit and reconciles the repo row and main worktree onto main', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    const folder = join(home, 'notes');
+    mkdirSync(folder);
+    writeFileSync(join(folder, 'todo.md'), '- ship\n');
+    const svc = service(t, home);
+    const project = await svc.add(folder);
+    await svc.gitInit(project.id);
+    expect(await t.app.git.isRepo(folder)).toBe(true);
+    expect(await t.app.git.currentBranch(folder)).toBe('main');
+    const head = await t.app.git.headCommit(folder);
+    expect(head).not.toBeNull();
+    expect(await t.app.git.untrackedFiles(folder)).toEqual(['todo.md']); // nothing in the folder was committed
+    expect(t.app.repos.repos.byProject(project.id)).toMatchObject({ defaultBranch: 'main', remotes: [] });
+    expect(t.app.repos.worktrees.mainOf(project.id)).toMatchObject({
+      branch: 'main',
+      path: folder,
+      baseCommit: head,
+      headCommit: head,
+    });
+    expect(t.app.repos.activity.recent(5).map((a) => a.what)).toContain('notes · git initialised on main');
+    // Idempotent on a git repo: no new commit, rows unchanged.
+    await svc.gitInit(project.id);
+    expect(await t.app.git.headCommit(folder)).toBe(head);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('describeRepos does not throw on non-git folders and marks them hasGit: false', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    const plain = join(home, 'plain');
+    mkdirSync(plain);
+    const repo = repoAt(home, 'code/repo');
+    const svc = service(t, home);
+    const rows = await svc.describeRepos([
+      { path: plain, source: 'ide-recent', activityAt: NOW - STALE_MS - DAY },
+      { path: repo, source: 'scan' },
+    ]);
+    expect(rows.map((r) => [r.path, r.hasGit, r.suggested])).toEqual([
+      [plain, false, false], // opened over a year ago → unchecked by default
+      [repo, true, true], // no remote, but the `.git` entry is fresh (unreadable repo: still listed)
+    ]);
+    rmSync(home, { recursive: true, force: true });
+  });
+});
+
+describe('project file policies.extra → projectRules', () => {
+  const file: ProjectFileV1 = {
+    version: 1,
+    name: 'acme-shop',
+    policies: {
+      extra: [
+        {
+          id: 'sb-read',
+          rule: {
+            kind: 'auto-approve',
+            match: { provider: ['supabase'] },
+            scopes: ['read'],
+            duration: 'session',
+          },
+          ruleText: 'Auto-approve Supabase reads',
+        },
+        {
+          id: 'off',
+          rule: { kind: 'ask', match: {}, scopes: ['delete'], requireMfa: true },
+          ruleText: 'Always ask for deletes',
+          enabled: false,
+        },
+      ],
+    },
+  };
+
+  it('maps file rules to engine policies in file order with namespaced ids', () => {
+    const rules = projectFileRules(file, NOW);
+    expect(rules.map((r) => [r.id, r.ord, r.enabled, r.builtinKey])).toEqual([
+      ['project:sb-read', 1, true, null],
+      ['project:off', 2, false, null],
+    ]);
+    expect(projectFileRules({ version: 1, name: 'x' }, NOW)).toEqual([]);
+  });
+
+  it('an extra auto-approve rule in .styx/project.json auto-approves a matching request', async () => {
+    const t = makeTestApp();
+    const dir = mkdtempSync(join(tmpdir(), 'styx-pf-'));
+    mkdirSync(join(dir, '.styx'));
+    writeFileSync(join(dir, '.styx', 'project.json'), JSON.stringify(file));
+    const project = t.app.repos.projects.get(ids.project.acmeShop);
+    if (!project) throw new Error('fixture project');
+    t.app.repos.projects.upsert({ ...project, path: dir });
+    // Not yet accepted on this machine: the auto-approve rule reads as `ask` (H-1), same ids.
+    expect(t.app.projects.projectRules(project.id).map((r) => [r.id, r.rule.kind])).toEqual([
+      ['project:sb-read', 'ask'],
+      ['project:off', 'ask'],
+    ]);
+    expect(t.app.projects.projectRules(project.id)).toBe(t.app.projects.projectRules(project.id)); // mtime cache
+    await t.app.projects.acceptPolicies(project.id, (await t.app.projects.pendingPolicy(project.id)).hash);
+    expect(t.app.projects.projectRules(project.id).map((r) => [r.id, r.rule.kind])).toEqual([
+      ['project:sb-read', 'auto-approve'],
+      ['project:off', 'ask'],
+    ]);
+    expect(t.app.projects.projectRules(project.id)).toBe(t.app.projects.projectRules(project.id)); // mtime cache
+
+    const target = t.app.repos.targets.get(ids.target.supabaseProd);
+    if (!target?.credentialRef) throw new Error('fixture target');
+    // Supabase hands the agent the whole token, so on *prod* an auto rule still asks (+MFA); staging auto-issues.
+    t.app.repos.targets.upsert({ ...target, env: 'staging' });
+    await t.vault.set(target.credentialRef, JSON.stringify({ token: 'sbp_test' }));
+    const out = await t.app.grants.request({
+      sessionId: ids.session.gemini,
+      targetId: ids.target.supabaseProd,
+      scope: ['read'],
+      reason: 'inspect schema',
+      triggeredBy: 'mcp:request_access',
+    });
+    expect(out.kind).toBe('active');
+    if (out.kind !== 'active') return;
+    expect(out.decidedBy).toBe('policy');
+    expect(out.grant.policyId).toBeNull(); // project rules are not `policies` rows; the audit cites the rule instead
+    const requested = t.app.repos.audit
+      .all()
+      .find((e) => e.action === 'requested' && e.grantId === out.grant.id);
+    expect(requested?.detail).toMatchObject({ projectRule: 'project:sb-read' });
+
+    // A write on prod still forces MFA → ask, even with the file rule present.
+    const write = await t.app.grants.request({
+      sessionId: ids.session.gemini,
+      targetId: ids.target.supabaseProd,
+      scope: ['write'],
+      reason: 'migration',
+      triggeredBy: 'mcp:request_access',
+    });
+    expect(write.kind).toBe('pending');
+  });
+
+  it('advisoryRules downgrades auto-approve to ask (same id), drops idle-expiry and keeps ask rules', () => {
+    const rules = projectFileRules(
+      {
+        version: 1,
+        name: 'x',
+        policies: {
+          extra: [
+            {
+              id: 'a',
+              rule: { kind: 'auto-approve', match: { env: ['prod'] }, scopes: ['write'], duration: 'always' },
+              ruleText: 'a',
+            },
+            { id: 'i', rule: { kind: 'idle-expiry', match: {}, idleMs: 24 * 3_600_000 }, ruleText: 'i' },
+            {
+              id: 'k',
+              rule: { kind: 'ask', match: {}, scopes: ['delete'], requireMfa: true },
+              ruleText: 'k',
+            },
+          ],
+        },
+      },
+      NOW,
+    );
+    expect(advisoryRules(rules).map((r) => [r.id, r.rule])).toEqual([
+      ['project:a', { kind: 'ask', match: { env: ['prod'] }, scopes: ['write'], requireMfa: false }],
+      ['project:k', { kind: 'ask', match: {}, scopes: ['delete'], requireMfa: true }],
+    ]);
+  });
+
+  it('policy summary / hash / diff cover policies.extra and targets[].policy only', () => {
+    const base: ProjectFileV1 = {
+      version: 1,
+      name: 'x',
+      targets: [
+        { name: 'GitHub', provider: 'github', env: 'scm', authMethod: 'oauth', policy: 'always' },
+        { name: 'Vercel', provider: 'vercel', env: 'prod', authMethod: 'oauth' },
+      ],
+      policies: {
+        extra: [
+          {
+            id: 'r1',
+            rule: { kind: 'ask', match: {}, scopes: ['delete'], requireMfa: true },
+            ruleText: 'r1',
+          },
+        ],
+      },
+    };
+    const s1 = policySummaryOf(base);
+    expect(s1).toEqual({
+      rules: [
+        { id: 'r1', rule: { kind: 'ask', match: {}, scopes: ['delete'], requireMfa: true }, ruleText: 'r1' },
+      ],
+      targets: [
+        { key: 'github/scm/GitHub', policy: 'always', config: {} },
+        { key: 'vercel/prod/Vercel', policy: null, config: {} },
+      ],
+    });
+    // Unrelated edits (settings, config) leave the hash alone; a policy edit changes it.
+    expect(
+      policyHashOf(
+        policySummaryOf({ ...base, agents: { autoApproveEdits: true }, worktrees: { baseBranch: 'dev' } }),
+      ),
+    ).toBe(policyHashOf(s1));
+    const next: ProjectFileV1 = {
+      ...base,
+      targets: [
+        { name: 'GitHub', provider: 'github', env: 'scm', authMethod: 'oauth' },
+        {
+          name: 'Vercel',
+          provider: 'vercel',
+          env: 'prod',
+          authMethod: 'oauth',
+          policy: 'always',
+          config: { teamSlug: 'evil' },
+        },
+      ],
+      policies: {
+        extra: [
+          {
+            id: 'r1',
+            rule: { kind: 'ask', match: {}, scopes: ['delete'], requireMfa: false },
+            ruleText: 'r1',
+          },
+          {
+            id: 'r2',
+            rule: { kind: 'auto-approve', match: {}, scopes: ['read'], duration: '1h' },
+            ruleText: 'r2',
+          },
+        ],
+      },
+    };
+    const s2 = policySummaryOf(next);
+    expect(policyHashOf(s2)).not.toBe(policyHashOf(s1));
+    expect(policyDiff(s1, s2)).toEqual({
+      rules: { added: ['r2'], removed: [], changed: ['r1'] },
+      targets: [
+        { target: 'github/scm/GitHub', from: 'always', to: null },
+        { target: 'vercel/prod/Vercel', from: null, to: 'always' },
+      ],
+      configChanged: ['vercel/prod/Vercel'],
+    });
+    expect(policyDiff(null, s1)).toEqual({
+      rules: { added: ['r1'], removed: [], changed: [] },
+      targets: [{ target: 'github/scm/GitHub', from: null, to: 'always' }],
+      configChanged: [],
+    });
+    // Config alone (no policies) still gates: it steers where a connected credential points.
+    expect(
+      policyHashOf(
+        policySummaryOf({
+          ...base,
+          policies: undefined,
+          targets: [
+            { name: 'V', provider: 'vercel', env: 'prod', authMethod: 'oauth', config: { project: 'a' } },
+          ],
+        }),
+      ),
+    ).not.toBe(
+      policyHashOf(
+        policySummaryOf({
+          ...base,
+          policies: undefined,
+          targets: [
+            { name: 'V', provider: 'vercel', env: 'prod', authMethod: 'oauth', config: { project: 'b' } },
+          ],
+        }),
+      ),
+    );
+  });
+
+  it('returns no rules when the project has no file', () => {
+    const t = makeTestApp();
+    expect(t.app.projects.projectRules(ids.project.blogV2)).toEqual([]);
+    expect(t.app.projects.projectRules('nope')).toEqual([]);
+  });
+});
+
+describe('project.create with createGithubRepo', () => {
+  it('creates the repo through the GitHub target, adds origin, pushes, and audits `connected`', async () => {
+    const calls: { url: string; method: string; body: unknown }[] = [];
+    const bare = mkdtempSync(join(tmpdir(), 'styx-bare-'));
+    const fetchFake: typeof fetch = async (input, init) => {
+      const url = String(input);
+      calls.push({
+        url,
+        method: init?.method ?? 'GET',
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      if (url === 'https://api.github.com/user') return Response.json({ login: 'me' });
+      if (url === 'https://api.github.com/orgs/acme/repos')
+        return Response.json(
+          {
+            full_name: 'acme/new-thing',
+            clone_url: bare,
+            html_url: 'https://github.com/acme/new-thing',
+            default_branch: 'main',
+          },
+          { status: 201 },
+        );
+      return new Response('nope', { status: 404 });
+    };
+    const t = makeTestApp({ fetch: fetchFake });
+    await t.app.git.init(bare);
+    await t.app.git['git'].run(['config', 'receive.denyCurrentBranch', 'ignore'], bare);
+    const gh = t.app.repos.targets.get(ids.target.github);
+    if (!gh?.credentialRef) throw new Error('fixture github target');
+    t.app.repos.targets.upsert({ ...gh, config: { ...gh.config, owner: 'acme' } });
+    await t.vault.set(gh.credentialRef, JSON.stringify({ token: 'gh_test' }));
+
+    const location = mkdtempSync(join(tmpdir(), 'styx-new-'));
+    const project = await t.app.projects.create({
+      name: 'new-thing',
+      location,
+      gitInit: true,
+      template: null,
+      copyTargetsFrom: null,
+      createGithubRepo: true,
+    });
+    expect(calls.map((c) => [c.method, c.url])).toEqual([
+      ['GET', 'https://api.github.com/user'],
+      ['POST', 'https://api.github.com/orgs/acme/repos'],
+    ]);
+    expect(calls[1]?.body).toEqual({ name: 'new-thing', private: true, auto_init: false });
+    const remotes = await t.app.git.remotes(project.path);
+    expect(remotes.map((r) => [r.name, r.url])).toEqual([['origin', bare]]);
+    expect(await t.app.git.headCommit(bare)).toBe(await t.app.git.headCommit(project.path)); // initial push landed
+    expect(t.app.repos.repos.byProject(project.id)?.remotes).toEqual([{ name: 'origin', url: bare }]);
+    const entry = t.app.repos.audit.all().find((e) => e.action === 'connected' && e.projectId === project.id);
+    expect(entry?.detail).toMatchObject({ repo: 'acme/new-thing' });
+    expect(entry?.targetId).toBe(gh.id);
+  });
+
+  it('project.connectRemote: an existing repo (URL, path, or owner/name) becomes origin; a second remote or a bad URL is refused', async () => {
+    const t = makeTestApp();
+    const root = mkdtempSync(join(tmpdir(), 'styx-connect-'));
+    const path = join(root, 'acme-shop');
+    mkdirSync(path);
+    await t.app.git.init(path);
+    await t.app.git.commit(path, 'init', { allowEmpty: true });
+    const project = t.app.repos.projects.get(ids.project.acmeShop);
+    if (!project) throw new Error('fixture project');
+    t.app.repos.projects.upsert({ ...project, path }, t.app.repos.projects.settings(project.id));
+    const repo = t.app.repos.repos.byProject(project.id);
+    if (!repo) throw new Error('fixture repo');
+    t.app.repos.repos.upsert({ ...repo, remotes: [] });
+    const bare = join(root, 'origin.git');
+    await t.app.git['git'].run(['init', '--bare', '-q', bare], root);
+
+    await expect(
+      t.app.projects.connectRemote(project.id, { kind: 'existing', url: 'not a url' }),
+    ).rejects.toMatchObject({ code: 'invalid-input' });
+    const r = await t.app.bus.dispatch(t.sender, 'project.connectRemote', {
+      projectId: project.id,
+      remote: { kind: 'existing', url: bare },
+    });
+    expect(r).toEqual({ ok: true, value: { url: bare, htmlUrl: null } });
+    expect((await t.app.git.remotes(path)).map((x) => [x.name, x.url])).toEqual([['origin', bare]]);
+    expect(t.app.repos.repos.byProject(project.id)?.remotes).toEqual([{ name: 'origin', url: bare }]);
+    expect(t.app.repos.activity.recent().map((a) => a.what)).toContain(`acme-shop · connected to ${bare}`);
+    // Already connected: refused unless the person asked to reconnect, which replaces origin outright.
+    await expect(
+      t.app.projects.connectRemote(project.id, {
+        kind: 'existing',
+        url: 'https://github.com/acme/other.git',
+      }),
+    ).rejects.toMatchObject({ code: 'invalid-input', message: expect.stringContaining(bare) });
+    const again = await t.app.projects.connectRemote(
+      project.id,
+      { kind: 'existing', url: 'acme/other' },
+      { replace: true },
+    );
+    expect(again).toEqual({
+      url: 'https://github.com/acme/other.git',
+      htmlUrl: 'https://github.com/acme/other',
+    });
+    expect((await t.app.git.remotes(path)).map((x) => [x.name, x.url])).toEqual([
+      ['origin', 'https://github.com/acme/other.git'],
+    ]);
+    // A bad URL on reconnect leaves the old remote in place.
+    await expect(
+      t.app.projects.connectRemote(project.id, { kind: 'existing', url: 'nope nope' }, { replace: true }),
+    ).rejects.toMatchObject({ code: 'invalid-input' });
+    expect((await t.app.git.remotes(path)).map((x) => x.url)).toEqual(['https://github.com/acme/other.git']);
+    // The shorthand and the ssh form resolve to github.com pages; other hosts have none.
+    expect(remoteUrlOf('acme/shop')).toBe('https://github.com/acme/shop.git');
+    expect(remoteUrlOf(' git@github.com:acme/shop.git ')).toBe('git@github.com:acme/shop.git');
+    expect(remoteUrlOf('https://gitlab.com/acme/shop')).toBe('https://gitlab.com/acme/shop');
+    expect(remoteUrlOf('C:\\code\\shop.git')).toBe('C:\\code\\shop.git');
+    expect(remoteUrlOf('D:/repos/x')).toBe('D:/repos/x');
+    expect(remoteUrlOf('acme shop')).toBeNull();
+    expect(githubHtmlUrl('https://github.com/acme/shop.git')).toBe('https://github.com/acme/shop');
+    expect(githubHtmlUrl('git@github.com:acme/shop.git')).toBe('https://github.com/acme/shop');
+    expect(githubHtmlUrl('https://gitlab.com/acme/shop.git')).toBeNull();
+  });
+
+  it('project.connectRemote: a new repo goes through the GitHub target with the chosen name and visibility, and the branch is pushed', async () => {
+    const calls: { url: string; method: string; body: unknown }[] = [];
+    const bare = mkdtempSync(join(tmpdir(), 'styx-bare-'));
+    const fetchFake: typeof fetch = async (input, init) => {
+      const url = String(input);
+      calls.push({
+        url,
+        method: init?.method ?? 'GET',
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      });
+      if (url === 'https://api.github.com/user') return Response.json({ login: 'me' });
+      // The fixture target may name an org owner: either endpoint answers the same way.
+      if (url === 'https://api.github.com/user/repos' || /\/orgs\/[^/]+\/repos$/.test(url))
+        return Response.json(
+          {
+            full_name: 'me/shop-web',
+            clone_url: bare,
+            html_url: 'https://github.com/me/shop-web',
+            default_branch: 'main',
+          },
+          { status: 201 },
+        );
+      return new Response('nope', { status: 404 });
+    };
+    const t = makeTestApp({ fetch: fetchFake });
+    await t.app.git.init(bare);
+    await t.app.git['git'].run(['config', 'receive.denyCurrentBranch', 'ignore'], bare);
+    const gh = t.app.repos.targets.get(ids.target.github);
+    if (!gh?.credentialRef) throw new Error('fixture github target');
+    await t.vault.set(gh.credentialRef, JSON.stringify({ token: 'gh_test' }));
+    const root = mkdtempSync(join(tmpdir(), 'styx-connect-'));
+    const path = join(root, 'acme-shop');
+    mkdirSync(path);
+    await t.app.git.init(path);
+    await t.app.git.commit(path, 'init', { allowEmpty: true });
+    const project = t.app.repos.projects.get(ids.project.acmeShop);
+    if (!project) throw new Error('fixture project');
+    t.app.repos.projects.upsert({ ...project, path }, t.app.repos.projects.settings(project.id));
+    const repo = t.app.repos.repos.byProject(project.id);
+    if (!repo) throw new Error('fixture repo');
+    t.app.repos.repos.upsert({ ...repo, remotes: [] });
+
+    const r = await t.app.projects.connectRemote(project.id, {
+      kind: 'create',
+      name: 'shop-web',
+      isPrivate: false,
+    });
+    expect(r).toEqual({ url: bare, htmlUrl: 'https://github.com/me/shop-web' });
+    expect(calls.map((c) => c.method)).toEqual(['GET', 'POST']);
+    expect(calls[1]?.url).toMatch(/\/repos$/);
+    expect(calls[1]?.body).toEqual({ name: 'shop-web', private: false, auto_init: false });
+    expect(t.app.repos.repos.byProject(project.id)?.remotes).toEqual([{ name: 'origin', url: bare }]);
+    expect(await t.app.git.headCommit(bare)).toBe(await t.app.git.headCommit(path));
+    const entry = t.app.repos.audit.all().find((e) => e.action === 'connected' && e.projectId === project.id);
+    expect(entry?.triggeredBy).toBe('project.connectRemote');
+  });
+
+  it('with no GitHub target connected the project is still made; the missing repo is reported with it, not over it', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const location = mkdtempSync(join(tmpdir(), 'styx-new-'));
+    const p = await t.app.projects.create({
+      name: 'lonely',
+      location,
+      gitInit: true,
+      template: null,
+      copyTargetsFrom: null,
+      createGithubRepo: true,
+    });
+    expect(p.githubError).toBe(copy.connectRepo.noGithub);
+    expect(t.app.repos.projects.get(p.id)?.name).toBe('lonely');
+    expect(existsSync(join(location, 'lonely', '.git'))).toBe(true);
+  });
+
+  it('project.templates lists built-ins plus styx-template repos in the target org', async () => {
+    const fetchFake: typeof fetch = async (input) => {
+      const url = String(input);
+      if (url.startsWith('https://api.github.com/search/repositories?q=topic%3Astyx-template%20org%3Aacme'))
+        return Response.json({ items: [{ name: 'svc-template', full_name: 'acme/svc-template' }] });
+      return new Response('nope', { status: 404 });
+    };
+    const t = makeTestApp({ fetch: fetchFake });
+    const gh = t.app.repos.targets.get(ids.target.github);
+    if (!gh?.credentialRef) throw new Error('fixture github target');
+    t.app.repos.targets.upsert({ ...gh, config: { ...gh.config, owner: 'acme' } });
+    await t.vault.set(gh.credentialRef, JSON.stringify({ token: 'gh_test' }));
+    const r = await t.app.bus.dispatch(t.sender, 'project.templates', {});
+    expect(r).toEqual({
+      ok: true,
+      value: {
+        builtins: ['node', 'python', 'go', 'rust', 'static'],
+        org: [{ name: 'svc-template', fullName: 'acme/svc-template' }],
+      },
+    });
+    const none = makeTestApp({ fixture: 'empty' });
+    expect(await none.app.bus.dispatch(none.sender, 'project.templates', {})).toMatchObject({
+      ok: true,
+      value: { org: [] },
+    });
+  });
+});
+
+describe('project file trust gate (H-1): reconcile, banner, accept, audit', () => {
+  const fileWith = (policy: 'always' | 'ask' | 'ask-mfa'): ProjectFileV1 => ({
+    version: 1,
+    name: 'acme-shop',
+    targets: [{ name: 'Vercel', provider: 'vercel', env: 'preview', authMethod: 'oauth', policy }],
+  });
+
+  it('reconcile does not copy targets[].policy until accepted; the banner is raised, then cleared and audited on accept', async () => {
+    const t = makeTestApp();
+    const dir = mkdtempSync(join(tmpdir(), 'styx-h1-'));
+    mkdirSync(join(dir, '.styx'));
+    writeFileSync(join(dir, '.styx', 'project.json'), JSON.stringify(fileWith('always')));
+    const project = t.app.repos.projects.get(ids.project.acmeShop)!;
+    t.app.repos.projects.upsert({ ...project, path: dir });
+    const preview = t.app.repos.targets.get(ids.target.vercelPreview)!;
+    t.app.repos.targets.upsert({ ...preview, policy: 'ask', policySource: 'app' });
+
+    expect(await t.app.projects.reconcileProjectFile(project.id)).toEqual({ ok: true, error: null });
+    expect(t.app.repos.targets.get(ids.target.vercelPreview)).toMatchObject({
+      policy: 'ask',
+      policySource: 'app',
+      fromProjectFile: true,
+    });
+    const key = `project-policy:${project.id}`;
+    expect(t.app.repos.notifications.byBannerKey(key)).toMatchObject({
+      kind: 'info',
+      state: 'shown',
+      projectId: project.id,
+    });
+    const pending = await t.app.projects.pendingPolicy(project.id);
+    expect(pending).toMatchObject({
+      accepted: false,
+      summary: { targets: [{ key: 'vercel/preview/Vercel', policy: 'always' }] },
+    });
+    expect(pending.diff).toEqual({
+      rules: { added: [], removed: [], changed: [] },
+      targets: [{ target: 'vercel/preview/Vercel', from: null, to: 'always' }],
+      configChanged: [],
+    });
+    expect(t.win.events('banner.set')).toContainEqual({
+      bannerKey: key,
+      kind: 'project-policy',
+      text: "acme-shop's .styx/project.json wants to change grant policies. Review in Settings.",
+      cta: 'Review',
+      action: { kind: 'review-project-policy', projectId: project.id, hash: pending.hash },
+      sessionId: null,
+      reason: null,
+    });
+    expect(t.app.repos.notifications.byBannerKey(key)?.meta).toBe(pending.hash);
+    // The accept token must match what is on disk now (TOCTOU: a pull between review and click is not accepted unseen).
+    await expect(t.app.projects.acceptPolicies(project.id, 'a'.repeat(64))).rejects.toMatchObject({
+      code: 'invalid-input',
+    });
+    expect(t.app.repos.targets.get(ids.target.vercelPreview)).toMatchObject({
+      policy: 'ask',
+      policySource: 'app',
+    });
+    // A restart re-emits the shown banner with the snapshot.
+    const snap = await t.app.bus.dispatch(t.sender, 'store.snapshot', {});
+    expect(snap.ok).toBe(true);
+    expect(
+      t.win.events('banner.set').filter((e) => (e as { bannerKey: string }).bannerKey === key).length,
+    ).toBe(2);
+
+    const auditBefore = t.app.repos.audit.all().length;
+    await t.app.projects.acceptPolicies(project.id, pending.hash);
+    expect(t.app.repos.targets.get(ids.target.vercelPreview)).toMatchObject({
+      policy: 'always',
+      policySource: 'project',
+    });
+    expect(t.app.repos.notifications.byBannerKey(key)).toMatchObject({ state: 'resolved' });
+    expect(t.win.events('banner.clear')).toContainEqual({ bannerKey: key });
+    const rows = t.app.repos.audit.all().slice(auditBefore);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      action: 'policy-changed',
+      actorKind: 'you',
+      projectId: project.id,
+      triggeredBy: 'settings',
+      detail: {
+        file: '.styx/project.json',
+        hash: pending.hash,
+        rules: { added: [], removed: [], changed: [] },
+        targets: [{ target: 'vercel/preview/Vercel', from: null, to: 'always' }],
+        configChanged: [],
+      },
+    });
+    expect(t.app.audit.verifyChain()).toMatchObject({ ok: true });
+
+    // The file changes the policy again → untrusted again: the row keeps the accepted value, the banner returns.
+    writeFileSync(join(dir, '.styx', 'project.json'), JSON.stringify(fileWith('ask-mfa')));
+    await t.app.projects.reconcileProjectFile(project.id);
+    expect(t.app.repos.targets.get(ids.target.vercelPreview)).toMatchObject({
+      policy: 'always',
+      policySource: 'project',
+    });
+    expect(t.app.repos.notifications.byBannerKey(key)).toMatchObject({ state: 'shown' });
+    expect((await t.app.projects.pendingPolicy(project.id)).accepted).toBe(false);
+    await t.app.projects.acceptPolicies(project.id, (await t.app.projects.pendingPolicy(project.id)).hash);
+    expect((await t.app.projects.pendingPolicy(project.id)).accepted).toBe(true);
+    expect(t.app.repos.targets.get(ids.target.vercelPreview)).toMatchObject({
+      policy: 'ask-mfa',
+      policySource: 'project',
+    });
+    const last = t.app.repos.audit.all().at(-1);
+    expect(last?.detail).toMatchObject({
+      targets: [{ target: 'vercel/preview/Vercel', from: 'always', to: 'ask-mfa' }],
+    });
+
+    // Removing the file clears the banner; a file without policy content never prompts.
+    writeFileSync(
+      join(dir, '.styx', 'project.json'),
+      JSON.stringify({ version: 1, name: 'acme-shop', agents: { default: 'codex' } }),
+    );
+    await t.app.projects.reconcileProjectFile(project.id);
+    expect(t.app.repos.notifications.byBannerKey(key)).toMatchObject({ state: 'resolved' });
+    expect(t.app.projects.projectPolicyTrusted(project.id)).toBe(true);
+    rmSync(join(dir, '.styx'), { recursive: true });
+    expect(await t.app.projects.reconcileProjectFile(project.id)).toEqual({ ok: true, error: null });
+    await expect(t.app.projects.acceptPolicies(project.id, 'a'.repeat(64))).rejects.toMatchObject({
+      code: 'not-found',
+    });
+    await expect(t.app.projects.pendingPolicy(project.id)).rejects.toMatchObject({ code: 'not-found' });
+  });
+
+  it('an untrusted file never re-points a connected target through config; unconnected rows take it for the Connect flow', async () => {
+    const t = makeTestApp();
+    const dir = mkdtempSync(join(tmpdir(), 'styx-h1-'));
+    mkdirSync(join(dir, '.styx'));
+    const file: ProjectFileV1 = {
+      version: 1,
+      name: 'acme-shop',
+      targets: [
+        {
+          name: 'Vercel',
+          provider: 'vercel',
+          env: 'preview',
+          authMethod: 'oauth',
+          config: { projectId: 'evil' },
+        },
+        {
+          name: 'New',
+          provider: 'vercel',
+          env: 'staging',
+          authMethod: 'oauth',
+          config: { projectId: 'prefill' },
+        },
+      ],
+    };
+    writeFileSync(join(dir, '.styx', 'project.json'), JSON.stringify(file));
+    const project = t.app.repos.projects.get(ids.project.acmeShop)!;
+    t.app.repos.projects.upsert({ ...project, path: dir });
+    const before = t.app.repos.targets.get(ids.target.vercelPreview)!;
+    await t.app.projects.reconcileProjectFile(project.id);
+    expect(t.app.repos.targets.get(ids.target.vercelPreview)?.config).toEqual(before.config);
+    expect(t.app.repos.targets.byProject(project.id).find((x) => x.name === 'New')?.config).toEqual({
+      projectId: 'prefill',
+    });
+    const r = await t.app.bus.dispatch(t.sender, 'project.policy.pending', { projectId: project.id });
+    if (!r.ok) throw new Error(r.error.message);
+    expect(r.value.diff.configChanged).toEqual(['vercel/preview/Vercel', 'vercel/staging/New']);
+    await t.app.bus.dispatch(t.sender, 'project.policy.accept', {
+      projectId: project.id,
+      hash: r.value.hash,
+    });
+    expect(t.app.repos.targets.get(ids.target.vercelPreview)?.config).toEqual({
+      ...before.config,
+      projectId: 'evil',
+    });
+  });
+
+  it('a new file target starts with the app default policy while untrusted', async () => {
+    const t = makeTestApp();
+    const dir = mkdtempSync(join(tmpdir(), 'styx-h1-'));
+    mkdirSync(join(dir, '.styx'));
+    const file: ProjectFileV1 = {
+      version: 1,
+      name: 'acme-shop',
+      targets: [{ name: 'Extra', provider: 'github', env: 'scm', authMethod: 'oauth', policy: 'always' }],
+    };
+    writeFileSync(join(dir, '.styx', 'project.json'), JSON.stringify(file));
+    const project = t.app.repos.projects.get(ids.project.acmeShop)!;
+    t.app.repos.projects.upsert({ ...project, path: dir });
+    await t.app.projects.reconcileProjectFile(project.id);
+    const extra = t.app.repos.targets.byProject(project.id).find((x) => x.name === 'Extra');
+    expect(extra).toMatchObject({
+      policy: 'ask',
+      policySource: 'app',
+      fromProjectFile: true,
+      credentialRef: null,
+    });
+    const bad = await t.app.bus.dispatch(t.sender, 'project.policy.accept', {
+      projectId: project.id,
+      hash: 'nope',
+    });
+    expect(bad).toMatchObject({ ok: false, error: { code: 'invalid-input' } });
+    const { hash } = await t.app.projects.pendingPolicy(project.id);
+    expect(
+      await t.app.bus.dispatch(t.sender, 'project.policy.accept', { projectId: project.id, hash }),
+    ).toEqual({ ok: true, value: {} });
+    expect(t.app.repos.targets.get(extra!.id)).toMatchObject({ policy: 'always', policySource: 'project' });
+  });
+});
+
+describe('project settings file', () => {
+  it('every key of the settings schema is written by setSettings (a hand-kept list once dropped permissionMode and effort)', async () => {
+    const t = makeTestApp();
+    const acme = fixtures.ids.project.acmeShop;
+    await t.app.projects.setSettings(acme, {
+      permissionMode: 'acceptEdits',
+      effort: 'high',
+      taskPermissionMode: 'plan',
+    });
+    const saved = t.app.repos.projects.settings(acme);
+    expect(saved.permissionMode).toBe('acceptEdits');
+    expect(saved.effort).toBe('high');
+    expect(saved.taskPermissionMode).toBe('plan');
+  });
+
+  it('permissionMode, taskPermissionMode and effort reach .styx/project.json (the page says "committed"), and read back', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const dir = mkdtempSync(join(tmpdir(), 'styx-settings-file-'));
+    const project = await t.app.projects.add(dir, 'filed');
+    await t.app.projects.setSettings(project.id, {
+      permissionMode: 'acceptEdits',
+      taskPermissionMode: 'plan',
+      effort: 'high',
+    });
+    const file = JSON.parse(readFileSync(join(dir, '.styx', 'project.json'), 'utf8')) as {
+      agents?: Record<string, unknown>;
+    };
+    expect(file.agents).toMatchObject({
+      permissionMode: 'acceptEdits',
+      taskPermissionMode: 'plan',
+      effort: 'high',
+    });
+    await t.app.projects.resetSetting(project.id, 'effort');
+    const again = JSON.parse(readFileSync(join(dir, '.styx', 'project.json'), 'utf8')) as {
+      agents?: Record<string, unknown>;
+    };
+    expect(again.agents).not.toHaveProperty('effort');
+    expect(again.agents).toMatchObject({ permissionMode: 'acceptEdits' });
+  });
+
+  it('issue #2: project.settings.set keeps the checks command as checks.command in .styx/project.json (trimmed), blank clears it, a secret is refused; it reads back', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const dir = mkdtempSync(join(tmpdir(), 'styx-checks-file-'));
+    const project = await t.app.projects.add(dir, 'checked');
+    const set = (checksCommand: string | null) =>
+      t.app.bus.dispatch(t.sender, 'project.settings.set', {
+        projectId: project.id,
+        patch: { checksCommand },
+      });
+    const fileOf = () =>
+      JSON.parse(readFileSync(join(dir, '.styx', 'project.json'), 'utf8')) as {
+        checks?: Record<string, unknown>;
+      };
+    expect(await set('  pnpm typecheck && pnpm test ')).toEqual({ ok: true, value: {} });
+    expect(fileOf().checks).toEqual({ command: 'pnpm typecheck && pnpm test' });
+    expect(t.app.repos.projects.settings(project.id).checksCommand).toBe('pnpm typecheck && pnpm test');
+    // Read back from the file (another clone, or Styx restarted): the value is the project's.
+    await t.app.projects.reconcileProjectFile(project.id);
+    expect(t.app.repos.projects.settings(project.id).checksCommand).toBe('pnpm typecheck && pnpm test');
+    expect(await set('TOKEN=abc123secretvalue pnpm test')).toMatchObject({
+      ok: false,
+      error: { code: 'invalid-input', message: copy.abilities.secretInCommand },
+    });
+    expect(fileOf().checks).toEqual({ command: 'pnpm typecheck && pnpm test' });
+    expect(await set('   ')).toEqual({ ok: true, value: {} });
+    expect(fileOf()).not.toHaveProperty('checks');
+    expect(t.app.repos.projects.settings(project.id).checksCommand ?? null).toBeNull();
+  });
+
+  it('a project whose path is not absolute (a fixture display path) keeps its settings in the store but never gets a file written under the working directory', async () => {
+    const t = makeTestApp();
+    const acme = fixtures.ids.project.acmeShop;
+    expect(t.app.repos.projects.get(acme)?.path).toBe('~/code/acme-shop');
+    await t.app.projects.setSettings(acme, { devCommand: 'pnpm dev' });
+    expect(t.app.repos.projects.settings(acme).devCommand).toBe('pnpm dev');
+    expect(existsSync(join(process.cwd(), '~'))).toBe(false);
+  });
+});
+
+describe('project settings: file vs this machine, re-reads and hand edits (issue #10)', () => {
+  /** A value for every setting that differs from the default and survives the file's own filters. */
+  const SAMPLE: ProjectSettings = {
+    defaultAgent: 'codex',
+    model: 'gpt-5',
+    permissionMode: 'acceptEdits',
+    taskPermissionMode: 'plan',
+    effort: 'high',
+    autoApproveEdits: true,
+    mayRequestTargets: false,
+    notifyWhenNeedsMe: false,
+    baseBranch: 'develop',
+    syncOnSpawn: false,
+    syncBeforePublish: false,
+    autoSync: 'off',
+    hotspots: ['pnpm-lock.yaml'],
+    integration: 'review',
+    autoLand: true,
+    checksCommand: 'make check',
+    branchPrefix: 'lane/',
+    worktreeLocation: 'inside',
+    shellWindows: 'wsl',
+    lineEndings: 'lf',
+    envFiles: ['.env'],
+    envShareWithAgents: 'never',
+    devUrl: 'http://localhost:4000',
+    devCommand: 'pnpm dev',
+    devPlatform: 'ios',
+    devDevice: 'iPhone 17 Pro',
+    devAppId: 'com.acme.shop',
+  };
+  const MACHINE: Partial<ProjectSettings> = {
+    syncOnSpawn: false,
+    syncBeforePublish: false,
+    autoSync: 'off',
+    integration: 'review',
+    autoLand: true,
+  };
+
+  it('every setting is either written to project.json and read back, or machine-only and never written', () => {
+    expect(Object.keys(SAMPLE).sort()).toEqual(Object.keys(projectSettingsSchema.shape).sort());
+    const file = applySettingsToFile({ version: 1, name: 'x' }, fileSettings(SAMPLE));
+    const parsed = parseProjectFile(JSON.stringify(file));
+    expect(parsed.ok).toBe(true);
+    const back = parsed.ok ? projectSettingsFromFile(parsed.file) : {};
+    for (const key of Object.keys(SAMPLE) as (keyof ProjectSettings)[]) {
+      expect(SAMPLE[key]).not.toEqual(DEFAULT_PROJECT_SETTINGS[key]);
+      if (isMachineProjectSetting(key)) expect(back).not.toHaveProperty(key);
+      else expect(back[key]).toEqual(SAMPLE[key]);
+    }
+    // Even handed every key, the writer puts no machine key in the file.
+    const raw = JSON.stringify(applySettingsToFile({ version: 1, name: 'x' }, SAMPLE));
+    for (const key of MACHINE_PROJECT_SETTINGS) expect(raw).not.toContain(`"${key}"`);
+  });
+
+  const addProject = async (t: ReturnType<typeof makeTestApp>) => {
+    const dir = mkdtempSync(join(tmpdir(), 'styx-issue10-'));
+    const project = await t.app.projects.add(dir, 'tenth');
+    const path = join(dir, '.styx', 'project.json');
+    const readFile = () => JSON.parse(readFileSync(path, 'utf8')) as ProjectFileV1;
+    let edits = 0;
+    /** A hand edit: rewrite the file and move its mtime on (same-millisecond writes would look unchanged). */
+    const handEdit = (edit: (f: ProjectFileV1) => ProjectFileV1) => {
+      writeFileSync(path, JSON.stringify(edit(readFile())));
+      edits += 1;
+      const later = new Date(Date.now() + edits * 60_000);
+      utimesSync(path, later, later);
+    };
+    return { dir, project, path, readFile, handEdit };
+  };
+
+  it('machine settings are stored on this machine, never in the file, and survive Accept project policies and re-adding the project', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const { project, readFile, handEdit } = await addProject(t);
+    await t.app.projects.setSettings(project.id, { ...MACHINE, baseBranch: 'develop' });
+    const file = readFile();
+    expect(file.worktrees).toEqual({ baseBranch: 'develop' });
+    for (const key of MACHINE_PROJECT_SETTINGS) expect(JSON.stringify(file)).not.toContain(`"${key}"`);
+    expect(t.app.repos.projects.settings(project.id)).toMatchObject(MACHINE);
+
+    // Accept project policies re-reads the file.
+    handEdit((f) => ({
+      ...f,
+      policies: {
+        extra: [
+          {
+            id: 'preview',
+            rule: { kind: 'ask', match: {}, scopes: ['deploy'], requireMfa: false },
+            ruleText: 'Ask before deploys',
+          },
+        ],
+      },
+    }));
+    const pending = await t.app.projects.pendingPolicy(project.id);
+    expect(
+      await t.app.bus.dispatch(t.sender, 'project.policy.accept', {
+        projectId: project.id,
+        hash: pending.hash,
+      }),
+    ).toEqual({ ok: true, value: {} });
+    expect(t.app.repos.projects.settings(project.id)).toMatchObject({ ...MACHINE, baseBranch: 'develop' });
+
+    // Remove and add again re-reads it too.
+    await t.app.projects.remove(project.id, false);
+    const back = await t.app.projects.add(project.path);
+    expect(back.id).toBe(project.id);
+    expect(t.app.repos.projects.settings(project.id)).toMatchObject({ ...MACHINE, baseBranch: 'develop' });
+    const effective = await t.app.bus.dispatch(t.sender, 'store.snapshot', {});
+    expect(effective.ok && effective.value.settings.project[project.id]?.autoLand.value).toBe(true);
+  });
+
+  it('a hand edit to project.json is picked up without re-adding: on select, on focus refresh and before a write; machine keys stay', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const { project, readFile, handEdit } = await addProject(t);
+    await t.app.projects.setSettings(project.id, { ...MACHINE, checksCommand: 'pnpm test' });
+
+    handEdit((f) => ({ ...f, worktrees: { baseBranch: 'develop' }, checks: { command: 'make check' } }));
+    expect(await t.app.bus.dispatch(t.sender, 'project.select', { projectId: project.id })).toEqual({
+      ok: true,
+      value: {},
+    });
+    expect(t.app.repos.projects.settings(project.id)).toMatchObject({
+      ...MACHINE,
+      baseBranch: 'develop',
+      checksCommand: 'make check',
+    });
+    const snap = await t.app.bus.dispatch(t.sender, 'store.snapshot', {});
+    expect(snap.ok && snap.value.settings.project[project.id]?.baseBranch.value).toBe('develop');
+
+    // The window-focus refresh (no project id) re-reads every project; a key taken out of the file goes back to its default.
+    handEdit((f) => ({ ...f, checks: {} }));
+    t.app.projects.refreshFromFile();
+    expect(t.app.repos.projects.settings(project.id).checksCommand).toBeUndefined();
+    expect(t.app.repos.projects.settings(project.id)).toMatchObject(MACHINE);
+
+    // Changing one setting in the app never undoes a hand edit made since the last read.
+    handEdit((f) => ({ ...f, dev: { command: 'pnpm start' } }));
+    await t.app.projects.setSettings(project.id, { autoSync: 'publish' });
+    expect(readFile()).toMatchObject({
+      worktrees: { baseBranch: 'develop' },
+      dev: { command: 'pnpm start' },
+    });
+    expect(t.app.repos.projects.settings(project.id)).toMatchObject({
+      autoSync: 'publish',
+      autoLand: true,
+      devCommand: 'pnpm start',
+      baseBranch: 'develop',
+    });
+  });
+
+  it('an invalid hand edit changes nothing; a deleted file leaves only the machine settings', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const { project, path } = await addProject(t);
+    await t.app.projects.setSettings(project.id, { ...MACHINE, baseBranch: 'develop' });
+    t.app.projects.refreshFromFile(project.id);
+
+    writeFileSync(path, '{ not json');
+    const later = new Date(Date.now() + 60_000);
+    utimesSync(path, later, later);
+    t.app.projects.refreshFromFile(project.id);
+    expect(t.app.repos.projects.settings(project.id)).toMatchObject({ ...MACHINE, baseBranch: 'develop' });
+
+    rmSync(path);
+    t.app.projects.refreshFromFile(project.id);
+    expect(t.app.repos.projects.settings(project.id)).toEqual(MACHINE);
+    expect(t.app.repos.projects.get(project.id)?.hasProjectFile).toBe(false);
+  });
+
+  it('reconcile without a file (it was deleted) keeps the machine settings', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const { project, path } = await addProject(t);
+    await t.app.projects.setSettings(project.id, { ...MACHINE, baseBranch: 'develop' });
+    rmSync(path);
+    expect(await t.app.projects.reconcileProjectFile(project.id)).toEqual({ ok: true, error: null });
+    expect(t.app.repos.projects.settings(project.id)).toEqual(MACHINE);
+  });
+});
+
+describe('New project never fails for want of git (owner request)', () => {
+  const service = (t: ReturnType<typeof makeTestApp>, home: string, git = t.app.git) =>
+    new ProjectService({
+      repos: t.app.repos,
+      publisher: t.app.publisher,
+      clock: t.clock,
+      git,
+      platform: 'darwin',
+      home,
+      templatesDir: null,
+      activity: t.app.activity,
+    });
+  const noGit = () => new GitService(new ExecaGitRunner({ gitBin: 'styx-no-such-git' }));
+  const input = (home: string, over: Partial<Parameters<ProjectService['create']>[0]> = {}) => ({
+    name: 'fresh',
+    location: home,
+    gitInit: true,
+    template: null,
+    copyTargetsFrom: null,
+    ...over,
+  });
+
+  it('without git it is made as a plain folder and says why; a retry of the same folder is not refused', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    const made = await service(t, home, noGit()).create(input(home, { createGithubRepo: true }));
+    expect(made.gitError).toBe(copy.newProject.gitMissing);
+    expect(made.githubError).toBe(copy.newProject.githubNeedsGit);
+    expect(existsSync(join(home, 'fresh', 'README.md'))).toBe(true);
+    expect(existsSync(join(home, 'fresh', '.git'))).toBe(false);
+    expect(t.app.repos.repos.byProject(made.id)?.defaultBranch).toBeNull();
+    // A folder holding only the README an earlier failed attempt left is reused, not refused as "not empty".
+    const t2 = makeTestApp({ fixture: 'empty' });
+    const again = await service(t2, home).create(input(home));
+    expect(again.gitError).toBeNull();
+    expect(existsSync(join(home, 'fresh', '.git'))).toBe(true);
+    rmSync(home, { recursive: true, force: true });
+  });
+
+  it('git init unticked means no git, even when git is installed', async () => {
+    const t = makeTestApp({ fixture: 'empty' });
+    const home = mkdtempSync(join(tmpdir(), 'styx-home-'));
+    const made = await service(t, home).create(input(home, { gitInit: false }));
+    expect(made.gitError).toBeNull();
+    expect(existsSync(join(home, 'fresh', '.git'))).toBe(false);
+    // Anything else in the folder is still refused.
+    writeFileSync(join(home, 'fresh', 'notes.md'), 'mine\n');
+    const t2 = makeTestApp({ fixture: 'empty' });
+    await expect(service(t2, home).create(input(home))).rejects.toThrow(/exists and is not empty/);
+    rmSync(home, { recursive: true, force: true });
+  });
+});

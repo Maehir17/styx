@@ -1,0 +1,111 @@
+@layer screens {
+  /* Prototype `data-screen-label="Repo"`: header · lanes table · lane diff header · bordered lane diff. */
+  .screen {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+    min-height: 0;
+  }
+  .head {
+    display: flex;
+    align-items: center;
+    gap: 14px;
+    padding: 14px 20px;
+    border-bottom: 1px solid var(--ln);
+    flex: none;
+  }
+  .title {
+    /* ADR-0027 §6: today's heading face at the page-title size. */
+    font-size: 28px;
+    font-weight: 600;
+    letter-spacing: -0.02em;
+    line-height: 1;
+  }
+  .meta {
+    font-family: var(--font-mono);
+    font-size: 12px;
+    color: var(--mu);
+  }
+  .spacer {
+    flex: 1;
+  }
+  .lanes {
+    flex: none;
+  }
+  /* Branch cell: mono 500 at the row's 12.5px (not the 12px mono cell). */
+  .branch {
+    font-family: var(--font-mono);
+    font-weight: 500;
+  }
+  /* Action cell is a label-styled button: the row is the hit target for select, the label for the verb. */
+  .action {
+    all: unset;
+    cursor: pointer;
+    font: inherit;
+    letter-spacing: inherit;
+    text-transform: inherit;
+    color: inherit;
+    position: relative;
+  }
+  .action::after {
+    content: '';
+    position: absolute;
+    inset: -9px -6px;
+  }
+  /* Two verbs in the action cell (Open PR · Diff …): one line each, a gap their extended hit areas (±6px) just fill. */
+  .actions {
+    gap: var(--sp-3);
+    white-space: nowrap;
+    /* Three verbs (Commit & push · Land · Diff) need ~148px; the prototype's .7fr column holds 142 at the 1100px
+       minimum (a few px more at 1280). They stay on one line and spill a few px into the PR column's empty right
+       half rather than wrap: a second line pushed every row below it down and broke the baked `repo` baseline. */
+  }
+  /* PR cell as a link when the PR's page is known: the mono text stays, underline says it opens. */
+  .prLink {
+    all: unset;
+    cursor: pointer;
+    font: inherit;
+    color: inherit;
+    text-decoration: underline;
+    text-underline-offset: 2px;
+  }
+  .prLink:focus-visible {
+    outline: 1px solid var(--tx);
+  }
+  .diffHead {
+    padding: 14px 20px 6px;
+    flex: none;
+  }
+  /* Keep lanes current (ADR-0023): `↓3 main` after the changes text; the click brings the base in. */
+  .syncAction {
+    position: relative;
+    font: inherit;
+    color: var(--act);
+    text-underline-offset: 3px;
+  }
+  .syncAction:hover {
+    text-decoration: underline;
+  }
+  .syncAction::after {
+    content: '';
+    position: absolute;
+    inset: -8px -6px;
+  }
+  /* Another live lane changed the same files (ADR-0025): accent-as-text after the changes cell; files in the title. */
+  .overlapTag {
+    color: var(--act);
+    white-space: nowrap;
+  }
+  /* The changes cell: counters, then `↓N main` and the overlaps tag; at the window minimum the tag wraps under. */
+  .changesCell {
+    flex-wrap: wrap;
+    row-gap: 2px;
+  }
+  /* Plain folder without git on the machine: the install note under the empty state, at its measure. */
+  .gitNote {
+    align-self: center;
+    width: min(520px, 100%);
+    padding: 0 var(--sp-6) var(--sp-6);
+  }
+}

@@ -1,0 +1,143 @@
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { basename, join } from 'node:path';
+import { afterEach, describe, expect, it } from 'vitest';
+import { BrokerClient } from './client';
+import { createStyxMcpServer } from './mcp-stdio';
+import { BrokerServer } from './server';
+
+const TOKEN = 't'.repeat(32);
+let server: BrokerServer;
+afterEach(async () => server?.close());
+
+describe('styx MCP server', () => {
+  it('exposes the ten tools and proxies calls to the broker', async () => {
+    // A Unix socket on POSIX; a uniquely named pipe on Windows (no AF_UNIX listen in TEMP).
+    const dir = mkdtempSync(join(tmpdir(), 'styx-mcp-'));
+    const path = process.platform === 'win32' ? `\\\\.\\pipe\\${basename(dir)}` : join(dir, 'b.sock');
+    server = new BrokerServer({
+      authenticate: async () => ({
+        sessionId: 's1',
+        projectId: 'p',
+        projectName: 'acme-shop',
+        worktreePath: null,
+        branch: null,
+        agent: 'claude',
+      }),
+    });
+    server.on('list_targets', async () => [
+      {
+        id: 'tgt-Supabase',
+        name: 'Supabase',
+        provider: 'supabase',
+        env: 'prod',
+        lockState: 'locked',
+        scopes: ['read', 'write'],
+      },
+    ]);
+    server.on('request_access', async (p) => ({
+      status: 'active',
+      grantId: 'g1',
+      scope: p.scope,
+      expiresAt: null,
+      decidedBy: 'policy',
+    }));
+    await server.listen(path);
+
+    const broker = new BrokerClient({ endpoint: path, sessionId: 's1', token: TOKEN, client: 'mcp', pid: 1 });
+    await broker.connect();
+    const mcp = createStyxMcpServer(broker);
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await mcp.connect(st);
+    const client = new Client({ name: 'test', version: '0' });
+    await client.connect(ct);
+
+    const tools = (await client.listTools()).tools.map((t) => t.name).sort();
+    expect(tools).toEqual([
+      'ask_user',
+      'check_grant',
+      'get_credential',
+      'land',
+      'list_sessions',
+      'list_targets',
+      'project_activity',
+      'remember_command',
+      'report_status',
+      'request_access',
+      'send_message',
+    ]);
+
+    const lt = await client.callTool({ name: 'list_targets', arguments: {} });
+    expect(JSON.parse((lt.content as { text: string }[])[0]?.text ?? '')).toEqual([
+      {
+        id: 'tgt-Supabase',
+        name: 'Supabase',
+        provider: 'supabase',
+        env: 'prod',
+        lockState: 'locked',
+        scopes: ['read', 'write'],
+      },
+    ]);
+
+    const ra = await client.callTool({
+      name: 'request_access',
+      arguments: { target: 'supabase-prod', scope: ['read'], reason: 'list tables' },
+    });
+    expect(JSON.parse((ra.content as { text: string }[])[0]?.text ?? '')).toMatchObject({
+      status: 'active',
+      grantId: 'g1',
+    });
+
+    const bad = await client.callTool({ name: 'get_credential', arguments: { grantId: 'nope' } });
+    expect(bad.isError).toBe(true);
+    broker.close();
+    await client.close();
+  });
+
+  it('remember_command takes kind "checks" (issue #2: the tool once accepted only run / deploy) and passes it on', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'styx-mcp-'));
+    const path = process.platform === 'win32' ? `\\\\.\\pipe\\${basename(dir)}` : join(dir, 'b.sock');
+    server = new BrokerServer({
+      authenticate: async () => ({
+        sessionId: 's1',
+        projectId: 'p',
+        projectName: 'acme-shop',
+        worktreePath: null,
+        branch: null,
+        agent: 'claude',
+      }),
+    });
+    const seen: unknown[] = [];
+    server.on('remember_command', async (p) => {
+      seen.push(p);
+      return { ok: true };
+    });
+    await server.listen(path);
+    const broker = new BrokerClient({ endpoint: path, sessionId: 's1', token: TOKEN, client: 'mcp', pid: 1 });
+    await broker.connect();
+    const mcp = createStyxMcpServer(broker);
+    const [ct, st] = InMemoryTransport.createLinkedPair();
+    await mcp.connect(st);
+    const client = new Client({ name: 'test', version: '0' });
+    await client.connect(ct);
+
+    const tool = (await client.listTools()).tools.find((t) => t.name === 'remember_command');
+    expect(JSON.stringify(tool?.inputSchema)).toContain('checks');
+    const r = await client.callTool({
+      name: 'remember_command',
+      arguments: { kind: 'checks', command: 'pnpm typecheck && pnpm test' },
+    });
+    expect(r.isError).not.toBe(true);
+    expect(seen).toEqual([{ kind: 'checks', command: 'pnpm typecheck && pnpm test' }]);
+    const bad = await client.callTool({
+      name: 'remember_command',
+      arguments: { kind: 'lint', command: 'x' },
+    });
+    expect(bad.isError).toBe(true);
+    expect(seen).toHaveLength(1);
+    broker.close();
+    await client.close();
+  });
+});

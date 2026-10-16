@@ -1,0 +1,126 @@
+import { copy, DEFAULT_PROJECT_SETTINGS, type ProjectSettings, type SessionId } from '@styx/core';
+import type { Container } from '../../container';
+import { commandCarriesSecret } from '../../services/logger';
+import { projectSettingsFor } from '../../store/projection';
+import { type CommandBus, fail } from '../bus';
+
+/** project.* */
+export function registerProjectCommands(bus: CommandBus, app: Container): void {
+  const { projects, repos } = app;
+
+  bus.register('project.scan', async ({ includeIdeRecents, includeAgentHistory }) => ({
+    repos: await projects.scan(includeIdeRecents, includeAgentHistory),
+  }));
+
+  bus.register('project.add', async ({ path, name }) => {
+    const project = await projects.add(path, name);
+    app.usageReports.record('project.added');
+    return { projectId: project.id };
+  });
+
+  bus.register('project.gitInit', async ({ projectId }) => {
+    await projects.gitInit(projectId);
+    return {};
+  });
+
+  bus.register('project.connectRemote', ({ projectId, remote, replace }) =>
+    projects.connectRemote(projectId, remote, { replace }),
+  );
+
+  /** "Open in {IDE} too": the fallback IDE, else the app setting's kind; nothing when neither is detected. */
+  const openInFallbackIde = (path: string): void => {
+    const ide =
+      repos.discovery.ides().find((i) => i.isFallback) ??
+      repos.discovery.ides().find((i) => i.kind === repos.settings.app().fallbackIde);
+    if (ide?.launcher) void app.openInIde(ide.launcher, path).catch(() => undefined);
+  };
+
+  bus.register('project.clone', async ({ url, into, openInIde }) => {
+    const project = await projects.clone(url, into);
+    app.usageReports.record('project.added');
+    if (openInIde) openInFallbackIde(project.path);
+    return { projectId: project.id };
+  });
+
+  bus.register('project.create', async (input) => {
+    const project = await projects.create({
+      name: input.name,
+      location: input.location,
+      gitInit: input.gitInit,
+      template: input.startFrom.kind === 'template' ? input.startFrom.template : null,
+      copyTargetsFrom: input.copyTargetsFrom,
+      createGithubRepo: input.createGithubRepo,
+    });
+    let sessionId: SessionId | null = null;
+    if (input.startFrom.kind === 'agent') {
+      const main = repos.worktrees.mainOf(project.id) ?? fail('internal', 'main worktree missing');
+      const settings = projectSettingsFor(repos, project.id);
+      const { session } = await app.sessions.spawn({
+        projectId: project.id,
+        agent: input.startFrom.agent,
+        worktree: { kind: 'existing', worktreeId: main.id },
+        firstMessage: `${input.startFrom.brief}\n\nScaffold the project skeleton in this empty worktree, then call ask_user(kind: "plan") before the first commit.`,
+        toggles: {
+          autoApproveEdits: settings.autoApproveEdits.value,
+          mayRequestTargets: settings.mayRequestTargets.value,
+          notifyWhenNeedsMe: settings.notifyWhenNeedsMe.value,
+        },
+        model: settings.model.value,
+        permissionMode: settings.permissionMode.value,
+        effort: settings.effort.value,
+      });
+      sessionId = session.id;
+    }
+    if (input.openInIde) openInFallbackIde(project.path);
+    app.usageReports.record('project.added');
+    return { projectId: project.id, sessionId, githubError: project.githubError, gitError: project.gitError };
+  });
+
+  bus.register('project.templates', () => projects.templates());
+
+  bus.register('project.remove', async ({ projectId, deleteFiles }) => {
+    // Nothing keeps running or holding access for a project that is off the rail: agents stop (their threads stay,
+    // and come back if the folder is added again) and every grant on its targets is closed.
+    for (const s of repos.sessions.byProject(projectId)) if (s.state !== 'done') app.sessions.stop(s.id);
+    for (const t of repos.targets.byProject(projectId)) app.grants.cancelTargetGrants(t.id);
+    const { sessionIds } = await projects.remove(projectId, deleteFiles);
+    for (const id of sessionIds) app.pty.kill(id);
+    return {};
+  });
+
+  bus.register('project.reorder', ({ projectIds }) => {
+    projects.reorder(projectIds);
+    return {};
+  });
+
+  bus.register('project.select', ({ projectId }) => {
+    projects.select(projectId);
+    return {};
+  });
+
+  bus.register('project.settings.set', async ({ projectId, patch }) => {
+    const next = { ...patch } as Partial<ProjectSettings>;
+    // Settings › Agent defaults › Checks (issue #2): typed by the person, so blank means "clear it" rather than a
+    // command that always passes; and like a learned one it is committed, so a secret in it is refused.
+    if (typeof next.checksCommand === 'string') {
+      const cmd = next.checksCommand.trim();
+      if (commandCarriesSecret(cmd)) fail('invalid-input', copy.abilities.secretInCommand);
+      next.checksCommand = cmd === '' ? null : cmd;
+    }
+    await projects.setSettings(projectId, next);
+    return {};
+  });
+
+  bus.register('project.policy.accept', async ({ projectId, hash }) => {
+    await projects.acceptPolicies(projectId, hash);
+    return {};
+  });
+
+  bus.register('project.policy.pending', ({ projectId }) => projects.pendingPolicy(projectId));
+
+  bus.register('project.settings.reset', async ({ projectId, key }) => {
+    if (!(key in DEFAULT_PROJECT_SETTINGS)) fail('invalid-input', `unknown setting ${key}`);
+    await projects.resetSetting(projectId, key);
+    return {};
+  });
+}

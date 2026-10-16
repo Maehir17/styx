@@ -1,0 +1,186 @@
+@layer screens {
+  .shell {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    flex-direction: column;
+    background: var(--bg);
+    color: var(--tx);
+  }
+  .body {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+    position: relative;
+  }
+  /* One rail column (ADR-0027 §5): the app's places, the project tiles, Settings at the foot. */
+  .rails {
+    width: var(--w-rail);
+    flex: none;
+    border-right: 1px solid var(--ln);
+    background: var(--s1);
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 10px 0;
+    min-height: 0;
+  }
+  .rail,
+  .appRail,
+  .railFoot {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    flex: none;
+  }
+  /* Projects take the room between the places and Settings, and scroll if there are many. */
+  .rail {
+    flex: 1 1 auto;
+    min-height: 0;
+    overflow-y: auto;
+    overflow-x: hidden;
+    padding: 2px 0;
+    width: 100%;
+  }
+  .railFoot {
+    padding-top: 8px;
+  }
+  .railsDivider {
+    width: 24px;
+    height: 1px;
+    flex: none;
+    background: var(--ln);
+    margin: 8px 0;
+  }
+  /* Rail "+" menu: chat overflow-menu recipe (1px --tx border on --s1), fixed beside the tile since the rail clips. */
+  .addMenu {
+    position: fixed;
+    z-index: 2;
+    min-width: 160px;
+    background: var(--s1);
+    border: 1px solid var(--tx);
+    display: flex;
+    flex-direction: column;
+  }
+  .addMenuItem {
+    display: flex;
+    align-items: center;
+    padding: 8px 12px;
+    border: 0;
+    background: transparent;
+    color: var(--tx);
+    font-family: var(--font-ui);
+    font-size: 12px;
+    font-weight: 600;
+    text-align: left;
+    white-space: nowrap;
+    cursor: pointer;
+  }
+  .addMenuItem:hover,
+  .addMenuItem:focus-visible {
+    background: var(--s2);
+  }
+  .nav {
+    width: var(--w-nav);
+    flex: none;
+    border-right: 1px solid var(--ln);
+    background: var(--s1);
+    display: flex;
+    flex-direction: column;
+    min-height: 0;
+    overflow-y: auto;
+  }
+  /* The project head is a button back to its workspace (ADR-0027 §1). */
+  .navProject {
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+    padding: 14px 14px 10px;
+    border: 0;
+    background: transparent;
+    color: var(--tx);
+    text-align: left;
+    cursor: pointer;
+  }
+  .navProject:hover {
+    background: var(--s2);
+  }
+  .navHead {
+    font-size: 16px;
+    font-weight: 600;
+    letter-spacing: -0.01em;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  /* Group headings: Work (with its count) and Project. */
+  .navGroup {
+    display: flex;
+    justify-content: space-between;
+    padding: 12px 14px 6px;
+    font-size: 12px;
+    color: var(--mu);
+    border-bottom: 1px solid var(--ln);
+  }
+  .navLanes {
+    display: flex;
+    flex-direction: column;
+    flex: none;
+  }
+  .navEmpty {
+    margin: 0;
+    padding: 10px 14px;
+    font-size: 13px;
+    color: var(--mu);
+  }
+  .navNewTask {
+    flex: none;
+    margin: 10px 14px 4px;
+    padding: 8px 10px;
+    border: 1px dashed var(--ln);
+    background: transparent;
+    color: var(--mu);
+    font-family: var(--font-ui);
+    font-size: 13px;
+    text-align: left;
+    cursor: pointer;
+  }
+  .navNewTask:hover {
+    border-style: solid;
+    border-color: var(--tx);
+    color: var(--tx);
+  }
+  /* Project details under the name: the branch, where the titlebar used to show it beside the project dropdown. */
+  .navBranch {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--mu);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .navFoot {
+    margin-top: auto;
+    padding: 12px 14px;
+    border-top: 1px solid var(--ln);
+    font-family: var(--font-mono);
+    font-size: 11px;
+    color: var(--mu);
+    line-height: 1.6;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .content {
+    flex: 1;
+    min-width: 0;
+    min-height: 0;
+    position: relative;
+    display: flex;
+    flex-direction: column;
+  }
+  .placeholder {
+    padding: 14px 16px;
+  }
+}

@@ -1,0 +1,189 @@
+import type {
+  Agent,
+  AskId,
+  AuditId,
+  PolicyId,
+  ProjectId,
+  Provider,
+  SessionId,
+  TargetId,
+  WorktreeId,
+} from '@styx/core';
+
+/** Overlay kinds and their z-order / behaviour (plan §8 Overlays). */
+export type OverlayKind = 'palette' | 'modal' | 'sheet' | 'drawer' | 'toast' | 'task';
+
+export type ToastPayload =
+  | { kind: 'ask'; askId: AskId; sessionId: SessionId; projectId: ProjectId }
+  | { kind: 'error'; code: string; message: string }
+  /** Plain confirmation (a skill installed or removed): heading + title, no actions. */
+  | { kind: 'info'; heading: string; title: string }
+  /** A deploy finished (succeeded / failed) while its modal was not open; "Show output" re-opens it. */
+  | { kind: 'deploy'; deployId: string; targetId: TargetId };
+
+export type ModalPayload =
+  | { modal: 'spawn'; projectId: ProjectId }
+  /** `clone` shows URL / Location / Open in IDE and runs `project.clone` (rail menu, Home, palette, onboarding). */
+  | { modal: 'new-project'; mode?: 'new' | 'clone' }
+  /** Recents + scanned repos with checkboxes → `project.add` each (rail menu, Home, palette; discrepancies #53). */
+  | { modal: 'add-existing' }
+  /**
+   * projectId is null during onboarding (no project yet); provider/targetId preselect the flow (Reconnect, step 4).
+   * `chooseProject` opens only the project picker for `targetId` (Settings › Targets "Choose project", issue #5).
+   */
+  | {
+      modal: 'connect';
+      projectId: ProjectId | null;
+      provider?: Provider;
+      targetId?: TargetId;
+      chooseProject?: true;
+    }
+  /** Deploy progress: starts a deploy for `targetId`, or attaches to a running one when `deployId` is given. */
+  | { modal: 'deploy'; targetId: TargetId; deployId?: string }
+  /** Per-target deploy commands for a project (targets without a built-in verb). */
+  | { modal: 'deploy-setup'; projectId: ProjectId }
+  /** Connect a project to a GitHub repo (Repo header, the Publish modal's notice); `returnTo` reopens Publish after. */
+  | { modal: 'connect-repo'; projectId: ProjectId; returnTo?: { modal: 'publish'; worktreeId: WorktreeId } }
+  /** Commit, push and PR in one step for a worktree (Repo lane, mode strip, palette; ADR-0021). */
+  | { modal: 'publish'; worktreeId: WorktreeId }
+  /** Land a lane into the base branch (Repo lane; ADR-0025 phase C). */
+  | { modal: 'land'; worktreeId: WorktreeId }
+  /**
+   * Connect agent (Settings › Agents, onboarding step 3, the Spawn modal's "Fix connection"): verify / sign in for one
+   * CLI. `returnTo` re-opens the Spawn modal for that project when the connect modal closes.
+   */
+  | { modal: 'connect-agent'; agent: Agent; returnTo?: { modal: 'spawn'; projectId: ProjectId } }
+  /** Approvals › Policies › + Rule: an auto-approve / ask rule; `policyId` edits an existing custom rule. */
+  | { modal: 'policy-rule'; policyId?: PolicyId }
+  /** The sign-in dialog (discrepancy row 113); `reason` only changes its one line of lead copy. */
+  | { modal: 'sign-in'; reason?: 'welcome' | 'plain' }
+  /** A downloaded update (#119): Restart to update, or Later (the banner stays). */
+  | { modal: 'update' }
+  /** Feedback to the owner (#123): status bar, palette. */
+  | { modal: 'feedback' };
+
+export type Overlay =
+  | { id: string; kind: 'task'; taskKey: string | null }
+  | { id: string; kind: 'palette' }
+  | ({ id: string; kind: 'modal' } & ModalPayload)
+  | { id: string; kind: 'sheet'; sheet: 'grant'; sessionId: SessionId; askId: AskId }
+  | { id: string; kind: 'drawer'; drawer: 'audit'; auditId: AuditId }
+  /** Skill reader (Settings › Skills): the catalogue SKILL.md by directory, read before it can be installed. */
+  | { id: string; kind: 'drawer'; drawer: 'skill'; directory: string }
+  | { id: string; kind: 'toast'; toast: ToastPayload };
+
+type DistributiveOmit<T, K extends PropertyKey> = T extends unknown ? Omit<T, K> : never;
+/** What callers push: the stack assigns the id. */
+export type OverlayInput = DistributiveOmit<Overlay, 'id'>;
+
+export interface OverlayTraits {
+  z: number;
+  /** Focus-trapping overlays make `#layer-app` inert. */
+  trap: boolean;
+  /** `--dim` backdrop. */
+  dim: boolean;
+}
+
+export const OVERLAY_TRAITS: Record<OverlayKind, OverlayTraits> = {
+  task: { z: 5, trap: false, dim: false },
+  palette: { z: 40, trap: true, dim: true },
+  modal: { z: 30, trap: true, dim: true },
+  toast: { z: 20, trap: false, dim: false },
+  sheet: { z: 10, trap: true, dim: false },
+  drawer: { z: 10, trap: true, dim: false },
+};
+
+let counter = 0;
+export const overlayId = (kind: OverlayKind): string => `${kind}-${++counter}`;
+
+/** Push keeps the stack sorted by z (stable within a z); at most one modal and one palette. */
+export const pushOverlay = (stack: readonly Overlay[], overlay: Overlay): Overlay[] => {
+  const base = stack.filter((o) => {
+    if (overlay.kind === 'task' && o.kind === 'task') return false;
+    if (overlay.kind === 'modal' && o.kind === 'modal') return false;
+    if (overlay.kind === 'palette' && o.kind === 'palette') return false;
+    return true;
+  });
+  const next = [...base, overlay];
+  return next.sort((a, b) => OVERLAY_TRAITS[a.kind].z - OVERLAY_TRAITS[b.kind].z);
+};
+
+export const topOverlay = (stack: readonly Overlay[]): Overlay | null => stack[stack.length - 1] ?? null;
+
+export const removeOverlay = (stack: readonly Overlay[], id: string): Overlay[] =>
+  stack.filter((o) => o.id !== id);
+
+export const isTrapping = (stack: readonly Overlay[]): boolean =>
+  stack.some((o) => OVERLAY_TRAITS[o.kind].trap);
+
+/**
+ * The overlay Esc should close (spec §6 "Close overlay: palette, modals, sheet, drawer, toast"): the topmost
+ * *trapping* overlay owns the keyboard, so it goes first; a toast is only popped when nothing traps.
+ */
+export const escapeTarget = (stack: readonly Overlay[]): Overlay | null => {
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const o = stack[i];
+    if (o !== undefined && OVERLAY_TRAITS[o.kind].trap) return o;
+  }
+  return topOverlay(stack);
+};
+
+export const findOverlay = <K extends OverlayKind>(
+  stack: readonly Overlay[],
+  kind: K,
+): Extract<Overlay, { kind: K }> | null => {
+  for (let i = stack.length - 1; i >= 0; i--) {
+    const o = stack[i];
+    if (o !== undefined && o.kind === kind) return o as Extract<Overlay, { kind: K }>;
+  }
+  return null;
+};
+
+// --- Invoker focus return -------------------------------------------------
+
+const invokers = new Map<string, WeakRef<HTMLElement>>();
+
+const activeElement = (): HTMLElement | null =>
+  typeof document !== 'undefined' && document.activeElement instanceof HTMLElement
+    ? document.activeElement
+    : null;
+
+/**
+ * A menu row unmounts with its menu the moment it opens an overlay, so focus could never go back to it. The
+ * button that opened the menu (`aria-haspopup="menu"` + `aria-expanded="true"`) is what the person came from.
+ */
+const anchorOfMenu = (el: HTMLElement): HTMLElement => {
+  if (el.closest('[role="menu"]') === null) return el;
+  const open = Array.from(
+    document.querySelectorAll<HTMLElement>('[aria-haspopup="menu"][aria-expanded="true"]'),
+  );
+  return open.at(-1) ?? el;
+};
+
+/** Records the element that had focus when `id` was pushed. */
+export const rememberInvoker = (id: string, el: HTMLElement | null = activeElement()): void => {
+  if (el !== null && typeof WeakRef === 'function') invokers.set(id, new WeakRef(anchorOfMenu(el)));
+};
+
+export const invokerOf = (id: string): HTMLElement | null => invokers.get(id)?.deref() ?? null;
+
+/**
+ * Restores focus to the invoker (next frame, only if still in the document). When the invoker sits inside the
+ * editor scope the scope root takes focus so Monaco can re-focus itself (plan §8: `editor.focus()`).
+ */
+export const restoreInvoker = (id: string): void => {
+  const target = invokerOf(id);
+  invokers.delete(id);
+  if (target === null) return;
+  const editor = target.closest<HTMLElement>('[data-keyscope="editor"]');
+  const focusTarget = editor ?? target;
+  const restore = () => {
+    if (focusTarget.isConnected) focusTarget.focus();
+  };
+  if (typeof requestAnimationFrame === 'function') requestAnimationFrame(restore);
+  else restore();
+};
+
+export const forgetInvoker = (id: string): void => {
+  invokers.delete(id);
+};

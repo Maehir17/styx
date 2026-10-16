@@ -1,0 +1,232 @@
+import { agentSchema, copy, idFrom, policyHashSchema, type EventPayload, type NotifyMode } from '@styx/core';
+import type { KvStore } from '../db/kv';
+import type { Repos } from '../db/repos';
+
+export interface TrayMenuItem {
+  label: string;
+  click?: () => void;
+  type?: 'separator' | 'checkbox';
+  checked?: boolean;
+}
+
+export interface OsNotifier {
+  /** macOS: dock badge count + single bounce on first ask; Windows: tray accent dot. */
+  setBadge(count: number): void;
+  bounceOnce(): void;
+  /** OS toast (Windows Action Center; macOS Notification Center) with Review / Later actions. */
+  toast(n: {
+    id: string;
+    title: string;
+    body: string;
+    sound: boolean;
+    onReview: () => void;
+    onLater: () => void;
+  }): void;
+  /** Windows tray (accent dot when `attention`, left-click → `onClick`) / macOS dock menu with the same items. */
+  setTray(opts: { attention: boolean; menu: TrayMenuItem[]; onClick: () => void }): void;
+}
+
+export interface AskSummary {
+  askId: string;
+  sessionId: string;
+  projectName: string;
+  branch: string | null;
+  agentLabel: string;
+  title: string; // "Codex wants Supabase prod · write"
+  meta: string; // 'acme-shop · test/flaky · "migration 0042"'
+}
+
+/** Attention plumbing (spec §4.14): in-app toasts are renderer-side from `ask.opened`; this owns badge, bounce, tray, DND and OS toasts. */
+export class NotificationService {
+  private bounced = false;
+  private recent: AskSummary[] = [];
+  private openCount = 0;
+
+  constructor(
+    private readonly os: OsNotifier,
+    private readonly kv: KvStore,
+    private readonly platform: NodeJS.Platform,
+    private readonly actions: {
+      review: (ask: AskSummary) => void;
+      later: (ask: AskSummary) => void;
+      openBoard: () => void;
+    },
+    /**
+     * Settings › Notify when an agent needs me (issue #4): `badge-sound` adds the toast's sound, `badge` is silent,
+     * `off` shows no badge, bounce, tray dot or OS notification (the board, inbox and tray menu still list what
+     * waits). Read on every call, so a change applies at once. Badge-only by default.
+     */
+    private readonly mode: () => NotifyMode = () => 'badge',
+  ) {}
+
+  get dnd(): boolean {
+    return this.kv.get<boolean>('notify.dnd') ?? false;
+  }
+
+  setDnd(on: boolean): void {
+    this.kv.set('notify.dnd', on);
+    this.refreshTray();
+  }
+
+  get sound(): boolean {
+    return this.mode() === 'badge-sound';
+  }
+
+  /** Notify › Off: nothing on the dock, taskbar or tray icon and no OS notification. */
+  get off(): boolean {
+    return this.mode() === 'off';
+  }
+
+  /** Whether a new ask reaches the OS as a notification: not in Do Not Disturb and notify is not Off. */
+  get delivers(): boolean {
+    return !this.dnd && !this.off;
+  }
+
+  /** Puts the tray / dock menu up at launch with the persisted open-ask count and DND state. */
+  start(openCount: number): void {
+    this.openCount = openCount;
+    this.refresh();
+  }
+
+  /** Re-applies the badge and tray for the current count; called when the notify setting changes. */
+  refresh(): void {
+    this.setBadge();
+    this.refreshTray();
+  }
+
+  private setBadge(): void {
+    this.os.setBadge(this.off ? 0 : this.openCount);
+  }
+
+  onAskOpened(ask: AskSummary, openCount: number): void {
+    this.openCount = openCount;
+    this.recent = [ask, ...this.recent.filter((a) => a.askId !== ask.askId)].slice(0, 5);
+    this.setBadge();
+    if (!this.bounced && this.platform === 'darwin' && !this.off) {
+      this.os.bounceOnce();
+      this.bounced = true; // never repeatedly
+    }
+    this.refreshTray();
+    if (this.delivers)
+      this.os.toast({
+        id: ask.askId,
+        title: ask.title,
+        body: ask.meta,
+        sound: this.sound,
+        onReview: () => this.actions.review(ask),
+        onLater: () => this.actions.later(ask),
+      });
+  }
+
+  onAskResolved(askId: string, openCount: number): void {
+    this.openCount = openCount;
+    this.recent = this.recent.filter((a) => a.askId !== askId);
+    this.setBadge();
+    if (openCount === 0) this.bounced = false;
+    this.refreshTray();
+  }
+
+  private refreshTray(): void {
+    this.os.setTray({
+      attention: this.openCount > 0 && !this.off,
+      onClick: this.actions.openBoard,
+      menu: [
+        {
+          label: this.openCount ? `${this.openCount} need you` : 'Nothing waiting on you',
+          click: this.actions.openBoard,
+        },
+        ...this.recent.map((a) => ({
+          label: `${a.agentLabel} · ${a.projectName} · ${a.title}`,
+          click: () => this.actions.review(a),
+        })),
+        { label: '', type: 'separator' as const },
+        {
+          label: 'Do Not Disturb',
+          type: 'checkbox' as const,
+          checked: this.dnd,
+          click: () => this.setDnd(!this.dnd),
+        },
+      ],
+    });
+  }
+}
+
+/**
+ * Persistent banners still `shown` in `notifications` (keyed by `banner_key`), rebuilt as `banner.set` payloads so a
+ * freshly connected window sees them again after a restart. Keys: `auth-expired:<targetId>` · `cli-missing:<agent>` ·
+ * `cli-outdated:<agent>` · `conflict:<worktreeId>` (kind `error-banner`) · `project-policy:<projectId>` (kind `info`);
+ * unknown keys are skipped.
+ */
+export function bannersToReemit(repos: Repos): EventPayload<'banner.set'>[] {
+  const out: EventPayload<'banner.set'>[] = [];
+  for (const n of repos.notifications.all()) {
+    if ((n.kind !== 'error-banner' && n.kind !== 'info') || n.state !== 'shown' || !n.bannerKey) continue;
+    const sep = n.bannerKey.indexOf(':');
+    const kind = n.bannerKey.slice(0, sep);
+    const id = n.bannerKey.slice(sep + 1);
+    if (!id) continue;
+    if (kind === 'project-policy') {
+      const hash = policyHashSchema.safeParse(n.meta);
+      if (n.kind !== 'info' || !hash.success || !repos.projects.get(id)) continue;
+      out.push({
+        bannerKey: n.bannerKey,
+        kind: 'project-policy',
+        text: n.title,
+        cta: copy.errors.projectPolicyUntrusted.cta,
+        action: { kind: 'review-project-policy', projectId: idFrom<'ProjectId'>(id), hash: hash.data },
+        sessionId: null,
+        reason: null,
+      });
+    } else if (n.kind !== 'error-banner') {
+      continue;
+    } else if (kind === 'auth-expired') {
+      if (!repos.targets.get(id)) continue;
+      out.push({
+        bannerKey: n.bannerKey,
+        kind: 'auth-expired',
+        text: n.title,
+        cta: copy.errors.authExpired.cta,
+        action: { kind: 'reconnect', targetId: idFrom<'TargetId'>(id) },
+        sessionId: n.sessionId,
+        reason: 'auth-expired',
+      });
+    } else if (kind === 'cli-missing') {
+      const agent = agentSchema.safeParse(id);
+      if (!agent.success) continue;
+      out.push({
+        bannerKey: n.bannerKey,
+        kind: 'cli-missing',
+        text: n.title,
+        cta: copy.errors.cliMissing.cta,
+        action: { kind: 'install-guide', agent: agent.data },
+        sessionId: n.sessionId,
+        reason: 'cli-missing',
+      });
+    } else if (kind === 'cli-outdated') {
+      const agent = agentSchema.safeParse(id);
+      if (!agent.success) continue;
+      out.push({
+        bannerKey: n.bannerKey,
+        kind: 'cli-outdated',
+        text: n.title,
+        cta: copy.errors.cliOutdated.cta,
+        action: { kind: 'install-guide', agent: agent.data },
+        sessionId: n.sessionId,
+        reason: null,
+      });
+    } else if (kind === 'conflict') {
+      const wt = repos.worktrees.get(id);
+      if (!wt) continue;
+      out.push({
+        bannerKey: n.bannerKey,
+        kind: 'conflict',
+        text: n.title,
+        cta: copy.errors.conflict.cta,
+        action: { kind: 'resolve', worktreeId: wt.id },
+        sessionId: n.sessionId,
+        reason: 'conflict',
+      });
+    }
+  }
+  return out;
+}

@@ -1,0 +1,83 @@
+appId: dev.styx.app
+productName: Styx
+directories:
+  buildResources: build
+  output: release
+files:
+  - out/**
+  - resources/**
+  - package.json
+asarUnpack:
+  - "**/*.node"
+  - "node_modules/node-pty/**"
+  - "resources/**"
+# Updates in place (#119): with a publish feed configured, electron-builder writes `app-update.yml` into the app and
+# `latest-mac.yml` / `latest.yml` next to the artefacts. A build never uploads anything itself (`--publish never` is the
+# default outside CI); `pnpm release:publish` puts a finished build on the feed. `${os}` is `mac`, `win` or `linux`
+# (`latest-linux.yml`; only the AppImage updates itself, a .deb is the package manager's).
+publish:
+  - provider: generic
+    url: https://storage.googleapis.com/styx-desktop-releases/${os}
+# Notarization runs in the afterSign hook (build/notarize.cjs) with the `styx-notary` keychain profile, so no
+# Apple password is ever an env var. electron-builder's own integration is off to avoid a second submission.
+afterSign: build/notarize.cjs
+# The .dmg is signed with the same Developer ID and notarized too (build/notarize-dmg.cjs), not only the app in it.
+afterAllArtifactBuild: build/notarize-dmg.cjs
+dmg:
+  sign: true
+mac:
+  category: public.app-category.developer-tools
+  hardenedRuntime: true
+  gatekeeperAssess: false
+  notarize: false
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
+  target: [dmg, zip]
+win:
+  target: [nsis]
+nsis:
+  # No spaces: GitHub renames spaces in release assets, and the feed (latest.yml) must name the file as uploaded.
+  artifactName: Styx-Setup-${version}.${ext}
+  oneClick: false
+  perMachine: false
+# The Microsoft Store package (`pnpm package:win:store`, Windows only). Microsoft signs it on submission, so Windows
+# shows no unknown-publisher warning and the Store delivers updates (the in-app updater is off in a Store build).
+# Identity values are Partner Center's Product identity for the reserved name; displayName must equal that name.
+# Tiles are in build/appx/.
+appx:
+  identityName: HeyStyx.HeyStyx
+  publisher: CN=03B88DAC-F4A5-4B15-A423-61DAEF99F34D
+  publisherDisplayName: Hey Styx
+  applicationId: Styx
+  displayName: Hey Styx
+  backgroundColor: "#0d0e0c"
+  languages: [en-US]
+# Linux (beta): an AppImage (any distro, updates itself) and a .deb (Debian/Ubuntu). The .deb installs the polkit
+# action that guards production grants (build/linux/polkit, see PolkitProvider in src/main/services/mfa-service.ts);
+# an AppImage can't install one and falls back to the standard pkexec prompt. Build these on Linux (CI does).
+linux:
+  target: [AppImage, deb]
+  category: Development
+  executableName: styx
+  artifactName: Styx-${version}-${arch}.${ext}
+  synopsis: Run coding agents on every project; they ask before they touch production.
+  description: >-
+    Styx runs Claude Code, Codex, Gemini CLI, Cursor and OpenCode across all your projects in one window. Each
+    task gets its own branch, and an agent has to ask before it deploys or touches anything live.
+  maintainer: Styx <hello@heystyx.com>
+  vendor: Styx
+  extraResources:
+    - from: build/linux/polkit
+      to: polkit
+  desktop:
+    entry:
+      StartupWMClass: Styx
+deb:
+  afterInstall: build/linux/after-install.sh
+  afterRemove: build/linux/after-remove.sh
+  # Secret Service for the keyring (@napi-rs/keyring); polkit for prod approvals.
+  depends: [libgtk-3-0, libnotify4, libnss3, libxss1, libxtst6, xdg-utils, libatspi2.0-0, libuuid1, libsecret-1-0]
+  recommends: [pkexec | policykit-1]
+protocols:
+  - name: Styx
+    schemes: [styx]

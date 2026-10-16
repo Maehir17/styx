@@ -1,0 +1,482 @@
+import type { AskId, ProjectId, SessionId, TargetId, WorktreeId } from '../ids';
+import { copy, fill } from '../copy';
+import type { Env, Provider } from '../model/common';
+import type { Target } from '../model/target';
+import { isDeployActive } from '../model/run';
+import type { ReadModel } from '../read-model';
+import { rows } from '../read-model';
+import {
+  activeLaneOf,
+  agentLabel,
+  headAskOf,
+  inLiveProject,
+  liveSessions,
+  projectBranch,
+  projectHasGit,
+  projectNameOf,
+  projectSettingsOfOrDefault,
+  projectWorktreeOf,
+} from './common-settings';
+import { formatAge, formatCountdown } from './format';
+import { taskOf } from './lanes';
+import { fuzzyBest } from './fuzzy';
+import { targetDerivedState } from './target-state';
+
+export type PaletteScope = 'all' | 'actions' | 'agents' | 'projects';
+export const PALETTE_SCOPES: readonly PaletteScope[] = ['all', 'actions', 'agents', 'projects'];
+
+/** ⇥ cycles scope. */
+const NEXT_SCOPE: Record<PaletteScope, PaletteScope> = {
+  all: 'actions',
+  actions: 'agents',
+  agents: 'projects',
+  projects: 'all',
+};
+export const nextPaletteScope = (scope: PaletteScope): PaletteScope => NEXT_SCOPE[scope];
+
+export type PaletteAction =
+  | { kind: 'deploy'; projectId: ProjectId; targetId: TargetId }
+  | { kind: 'review-ask'; sessionId: SessionId; askId: AskId }
+  | { kind: 'spawn'; projectId: ProjectId }
+  /** ADR-0027: open New task in the project with the typed words as the task. */
+  | { kind: 'new-task'; projectId: ProjectId; text: string }
+  | { kind: 'new-project' }
+  /** Owner additions: the recents/scan list, an existing repo (folder picker) or a clone, like the rail menu. */
+  | { kind: 'add-existing' }
+  | { kind: 'open-folder' }
+  | { kind: 'clone-url' }
+  | { kind: 'agent-dock' }
+  /** The feedback dialog (owner request, #123). */
+  | { kind: 'feedback' }
+  /** Replay the first-run walkthrough (owner request, #124). */
+  | { kind: 'tour' }
+  | { kind: 'debt-audit'; projectId: ProjectId }
+  /** Commit, push and PR in one step for the worktree the project is on (ADR-0021). */
+  | { kind: 'publish'; projectId: ProjectId; worktreeId: WorktreeId }
+  | { kind: 'open-session'; sessionId: SessionId }
+  /** A finished chat that is no longer on the nav (closed, or past the 7 days): reopened, then shown. */
+  | { kind: 'reopen-session'; sessionId: SessionId }
+  /** Snake in the project's chat pane (owner addition, discrepancy row 110). */
+  | { kind: 'arcade'; projectId: ProjectId }
+  | { kind: 'switch-project'; projectId: ProjectId };
+
+export interface PaletteItem {
+  id: string;
+  /** ▲ deploy · ◆ grant · + spawn · ■ project/new · ● agent */
+  glyph: '▲' | '◆' | '+' | '■' | '●';
+  label: string;
+  meta: string;
+  /** The preselected (inverted) row. */
+  first: boolean;
+  action: PaletteAction;
+}
+
+export interface PaletteGroup {
+  key: Exclude<PaletteScope, 'all'>;
+  label: string;
+  items: PaletteItem[];
+}
+
+export interface PaletteUi {
+  projectId: ProjectId | null;
+  /** The chat tab the person is on: Publish offers that lane (what the editor column shows). */
+  sessionId?: SessionId | null;
+}
+
+/** Providers with a built-in deploy verb (`adapter.deployCommand`). */
+export const DEPLOYABLE_PROVIDERS: readonly Provider[] = ['vercel', 'fly', 'railway', 'render'];
+
+/** A config value composed into a built-in deploy argv: a plain identifier, never something that reads as a flag. */
+const DEPLOY_ID = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/;
+const deployId = (t: { config: Readonly<Record<string, unknown>> }, key: string): string | null => {
+  const v = t.config[key];
+  return typeof v === 'string' && DEPLOY_ID.test(v) ? v : null;
+};
+
+/**
+ * The built-in deploy verb of a provider in `DEPLOYABLE_PROVIDERS`, as argv (main's `adapter.deployCommand` runs
+ * exactly this; Settings shows it). Only plain identifiers from the target's config are composed in, since a
+ * committed `.styx/project.json` can seed that config. Null for providers without one.
+ */
+export const builtInDeployCommand = (t: {
+  provider: Provider;
+  env: Env;
+  config: Readonly<Record<string, unknown>>;
+}): { bin: string; args: string[] } | null => {
+  switch (t.provider) {
+    case 'vercel':
+      return { bin: 'vercel', args: t.env === 'prod' ? ['deploy', '--prod'] : ['deploy'] };
+    case 'fly': {
+      // Each Fly.io target is one app; `fly.toml` in the repo names it too, but the target's own app wins.
+      const app = deployId(t, 'app');
+      return { bin: 'fly', args: ['deploy', ...(app === null ? [] : ['--app', app])] };
+    }
+    case 'railway': {
+      // The grant's project token already names the project and environment; `--ci` streams the build and exits.
+      const service = deployId(t, 'service');
+      return { bin: 'railway', args: ['up', '--ci', ...(service === null ? [] : ['--service', service])] };
+    }
+    case 'render': {
+      const service = deployId(t, 'serviceId');
+      // Without a chosen service the CLI asks which one, in the terminal the deploy runs in.
+      return {
+        bin: 'render',
+        args:
+          service === null ? ['deploys', 'create'] : ['deploys', 'create', service, '--confirm', '--wait'],
+      };
+    }
+    default:
+      return null;
+  }
+};
+
+/** The user's own deploy command for a target (`config.deployCommand`), or null when none is set. */
+export const deployCommandOf = (t: Pick<Target, 'config'>): string | null => {
+  const v = t.config['deployCommand'];
+  return typeof v === 'string' && v.trim() !== '' ? v.trim() : null;
+};
+
+/**
+ * A target Styx can deploy to: a provider with a built-in verb, or any target the user gave a deploy command
+ * (owner request: GCP / AWS / SSH targets were "permanently greyed out" because only Vercel had a verb).
+ */
+export const isDeployableTarget = (t: Pick<Target, 'provider' | 'config'>): boolean =>
+  DEPLOYABLE_PROVIDERS.includes(t.provider) || deployCommandOf(t) !== null;
+
+/** How a target is named wherever a deploy is offered (palette row, deploy button, toast, status bar): `Vercel prod`. */
+export const deployTargetLabel = (t: Pick<Target, 'name' | 'env'>): string => `${t.name} ${t.env}`;
+
+/** One row of the workspace deploy picker. */
+export interface DeployTargetOption {
+  targetId: TargetId;
+  /** `Vercel prod`: the palette's deploy-row label for the target. */
+  label: string;
+  name: string;
+  env: Env;
+  prod: boolean;
+  /** Styx has no command for this target yet: choosing it hands the first deploy to the agent. */
+  learn: boolean;
+}
+
+/** Least to most consequential: production always comes last, so it is never the row a stray Enter lands on. */
+const ENV_ORDER: Readonly<Record<Env, number>> = { preview: 0, staging: 1, scm: 2, prod: 3 };
+
+/**
+ * Every target of a project the deploy button can offer (issue #9: with a prod target it used to offer prod only,
+ * and staging / preview were reachable from the palette alone). Like the palette, every target is a candidate: one
+ * Styx has no command for yet hands the first deploy to the agent (`learn`). Ordered preview → staging → scm →
+ * prod, stable within an env, so production is the last and deliberate choice.
+ */
+export const deployTargetOptions = (model: ReadModel, projectId: ProjectId): DeployTargetOption[] =>
+  rows(model.targets)
+    .filter((t) => t.projectId === projectId)
+    .map((t, i) => ({ t, i }))
+    .sort((a, b) => ENV_ORDER[a.t.env] - ENV_ORDER[b.t.env] || a.i - b.i)
+    .map(({ t }) => ({
+      targetId: t.id,
+      label: deployTargetLabel(t),
+      name: t.name,
+      env: t.env,
+      prod: t.env === 'prod',
+      learn: !isDeployableTarget(t),
+    }));
+
+const lockMeta = (model: ReadModel, targetId: TargetId, now: number): string => {
+  // A deploy already running for this target is the thing to know before pressing Enter on the row again.
+  for (const d of Object.values(model.deploys)) {
+    if (d.targetId === targetId && isDeployActive(d)) return copy.deploy.inFlight;
+  }
+  const state = targetDerivedState(model, targetId, now);
+  switch (state.kind) {
+    case 'open':
+      return fill(copy.palette.meta.open, { t: formatCountdown(state.openUntil - now) });
+    case 'persistent':
+      return copy.palette.meta.always;
+    case 'locked':
+      return copy.palette.meta.locked;
+    case 'expired':
+      return copy.palette.meta.expired;
+    case 'unconnected':
+      return copy.palette.meta.unconnected;
+  }
+};
+
+const stateMeta = (state: string): string => (state === 'needs-you' ? copy.palette.meta.needsYou : state);
+
+const actionItems = (model: ReadModel, ui: PaletteUi, now: number): PaletteItem[] => {
+  const items: PaletteItem[] = [];
+  const projectId = ui.projectId;
+  if (projectId !== null) {
+    const project = projectNameOf(model, projectId);
+    // Every target of the project, not only the ones with a deploy verb or a learned command: a row for a target
+    // Styx cannot deploy to yet hands the first deploy to the agent (owner principle, AI-native).
+    for (const t of rows(model.targets)) {
+      if (t.projectId !== projectId) continue;
+      items.push({
+        id: `deploy:${t.id}`,
+        glyph: '▲',
+        label: fill(copy.palette.actions.deploy, { project, target: deployTargetLabel(t) }),
+        meta: lockMeta(model, t.id, now),
+        first: false,
+        action: { kind: 'deploy', projectId, targetId: t.id },
+      });
+    }
+    for (const s of liveSessions(model).filter((s) => !s.purpose)) {
+      if (s.projectId !== projectId || s.state !== 'needs-you') continue;
+      const ask = headAskOf(model, s.id);
+      if (ask === null || ask.kind !== 'grant' || ask.grantId === null) continue;
+      const grant = model.grants.byId[ask.grantId];
+      const target = grant === undefined ? undefined : model.targets.byId[grant.targetId];
+      if (target === undefined) continue;
+      items.push({
+        id: `grant:${ask.id}`,
+        glyph: '◆',
+        label: fill(copy.palette.actions.grant, {
+          agent: agentLabel(s),
+          target: `${target.name} ${target.env}`,
+        }),
+        meta: copy.palette.meta.needsYou,
+        first: false,
+        action: { kind: 'review-ask', sessionId: s.id, askId: ask.id },
+      });
+    }
+    items.push({
+      id: `spawn:${projectId}`,
+      glyph: '+',
+      label: fill(copy.palette.actions.spawn, { project }),
+      meta: fill(copy.palette.actions.spawnMeta, {
+        agent: projectSettingsOfOrDefault(model, projectId).defaultAgent,
+      }),
+      first: false,
+      action: { kind: 'spawn', projectId },
+    });
+  }
+  items.push({
+    id: 'new-project',
+    glyph: '■',
+    label: copy.palette.actions.newProject,
+    meta: copy.palette.actions.newProjectMeta,
+    first: false,
+    action: { kind: 'new-project' },
+  });
+  items.push({
+    id: 'add-existing',
+    glyph: '■',
+    label: copy.palette.actions.addExisting,
+    meta: copy.palette.actions.addExistingMeta,
+    first: false,
+    action: { kind: 'add-existing' },
+  });
+  items.push({
+    id: 'open-folder',
+    glyph: '■',
+    label: copy.palette.actions.openFolder,
+    meta: copy.palette.actions.openFolderMeta,
+    first: false,
+    action: { kind: 'open-folder' },
+  });
+  items.push({
+    id: 'clone-url',
+    glyph: '■',
+    label: copy.palette.actions.cloneUrl,
+    meta: copy.palette.actions.cloneUrlMeta,
+    first: false,
+    action: { kind: 'clone-url' },
+  });
+  if (projectId !== null)
+    items.push({
+      id: 'debt-audit',
+      glyph: '▲',
+      label: copy.debtAudit.action,
+      meta: copy.palette.actions.debtAuditMeta,
+      first: false,
+      action: { kind: 'debt-audit', projectId },
+    });
+  // Publish the branch the project is on (a plain folder has no branch to push).
+  const wt = projectId === null ? null : projectWorktreeOf(model, projectId, ui.sessionId ?? null);
+  if (projectId !== null && wt !== null && wt.branch !== null && projectHasGit(model, projectId))
+    items.push({
+      id: `publish:${wt.id}`,
+      glyph: '▲',
+      label: fill(copy.palette.actions.publish, {
+        project: projectNameOf(model, projectId),
+        branch: wt.branch,
+      }),
+      meta: copy.palette.actions.publishMeta,
+      first: false,
+      action: { kind: 'publish', projectId, worktreeId: wt.id },
+    });
+  items.push({
+    id: 'agent-dock',
+    glyph: '■',
+    label: copy.chat.agentDock.open,
+    meta: copy.palette.actions.agentDockMeta,
+    first: false,
+    action: { kind: 'agent-dock' },
+  });
+  items.push({
+    id: 'feedback',
+    glyph: '■',
+    label: copy.feedback.title,
+    meta: copy.palette.actions.feedbackMeta,
+    first: false,
+    action: { kind: 'feedback' },
+  });
+  items.push({
+    id: 'tour',
+    glyph: '■',
+    label: copy.tour.palette,
+    meta: copy.tour.paletteMeta,
+    first: false,
+    action: { kind: 'tour' },
+  });
+  // Snake in the chat pane (any tab on screen but one waiting on the person: that ask comes first). The tab is
+  // resolved the way the chat pane resolves it (the first tab until one is picked), not from the raw selection —
+  // before the first click the pane already shows a tab, and the palette must agree with it.
+  const onScreen = projectId === null ? null : activeLaneOf(model, projectId, ui.sessionId ?? null);
+  const tab = onScreen === null ? undefined : model.sessions.byId[onScreen];
+  if (projectId !== null && tab !== undefined && tab.state !== 'needs-you')
+    items.push({
+      id: `arcade:${projectId}`,
+      glyph: '■',
+      label: copy.arcade.action,
+      meta: copy.arcade.actionMeta,
+      first: false,
+      action: { kind: 'arcade', projectId },
+    });
+  return items;
+};
+
+const agentItems = (model: ReadModel, query: string, now: number): PaletteItem[] => [
+  ...liveSessions(model)
+    .filter((s) => !s.purpose)
+    .filter((s) => s.state !== 'done')
+    .map((s): PaletteItem => ({
+      id: `session:${s.id}`,
+      glyph: '●',
+      label: `${agentLabel(s)} · ${projectNameOf(model, s.projectId)}`,
+      meta: stateMeta(s.state),
+      first: false,
+      action: { kind: 'open-session', sessionId: s.id },
+    })),
+  // Finished chats, archived ones included, while searching (an empty palette stays short): found by what they
+  // were asked, and reopened where they left off.
+  ...(query.trim() === '' ? [] : finishedChats(model, now)),
+];
+
+const finishedChats = (model: ReadModel, now: number): PaletteItem[] =>
+  rows(model.sessions)
+    .filter((s) => s.state === 'done' && !s.purpose && inLiveProject(model, s))
+    .sort((a, b) => (b.endedAt ?? b.startedAt) - (a.endedAt ?? a.startedAt))
+    .map((s) => {
+      const task = taskOf(s);
+      const vars = { task, agent: agentLabel(s), project: projectNameOf(model, s.projectId) };
+      return {
+        id: `finished:${s.id}`,
+        glyph: '●',
+        label: fill(
+          task === '' ? copy.palette.actions.reopenChatUntitled : copy.palette.actions.reopenChat,
+          vars,
+        ),
+        meta: fill(copy.palette.actions.reopenChatMeta, { t: formatAge(s.endedAt ?? s.startedAt, now) }),
+        first: false,
+        action:
+          s.archivedAt === null
+            ? { kind: 'open-session', sessionId: s.id }
+            : { kind: 'reopen-session', sessionId: s.id },
+      };
+    });
+
+const projectItems = (model: ReadModel): PaletteItem[] =>
+  rows(model.projects)
+    .filter((p) => p.removedAt === null)
+    .map((p) => ({
+      id: `project:${p.id}`,
+      glyph: '■',
+      label: fill(copy.palette.actions.switchProject, { project: p.name }),
+      meta: projectBranch(model, p.id),
+      first: false,
+      action: { kind: 'switch-project', projectId: p.id },
+    }));
+
+const rank = (items: PaletteItem[], query: string): PaletteItem[] => {
+  if (query.trim().length === 0) return items;
+  return items
+    .map((item, index) => ({ item, index, score: fuzzyBest(query, [item.label, item.meta]) }))
+    .filter((x): x is { item: PaletteItem; index: number; score: number } => x.score !== null)
+    .sort((a, b) => b.score - a.score || a.index - b.index)
+    .map((x) => x.item);
+};
+
+/**
+ * Groups Actions / Agents / Projects, fuzzy on label + meta, first row flagged, empty groups dropped,
+ * scope filtering (⇥). Lock state lives in each action's meta.
+ */
+/** A query this long or longer may be a task in words rather than the name of a command. */
+const TASK_MIN_CHARS = 3;
+/** With this many words, it reads as a sentence: Start as a task comes first. */
+const TASK_SENTENCE_WORDS = 3;
+const TASK_LABEL_MAX = 60;
+
+/**
+ * "Start “…” as a task in acme-shop" (ADR-0027): what was typed, as New task in the current project. Offered first
+ * when the query reads as a sentence (three words or more); absent with no project, or for a word or two, which
+ * are commands.
+ */
+const taskItem = (
+  model: ReadModel,
+  ui: PaletteUi,
+  query: string,
+): { item: PaletteItem; lead: boolean } | null => {
+  const text = query.trim().replace(/\s+/g, ' ');
+  if (ui.projectId === null || text.length < TASK_MIN_CHARS) return null;
+  const shown = text.length > TASK_LABEL_MAX ? `${text.slice(0, TASK_LABEL_MAX - 1).trimEnd()}…` : text;
+  return {
+    item: {
+      id: 'new-task',
+      glyph: '+',
+      label: fill(copy.palette.actions.newTask, { text: shown, project: projectNameOf(model, ui.projectId) }),
+      meta: copy.palette.actions.newTaskMeta,
+      first: false,
+      action: { kind: 'new-task', projectId: ui.projectId, text },
+    },
+    lead: text.split(' ').length >= TASK_SENTENCE_WORDS,
+  };
+};
+
+export const paletteResults = (
+  model: ReadModel,
+  ui: PaletteUi,
+  query: string,
+  scope: PaletteScope,
+  now: number,
+): PaletteGroup[] => {
+  const all: PaletteGroup[] = [
+    { key: 'actions', label: copy.palette.groups.actions, items: actionItems(model, ui, now) },
+    { key: 'agents', label: copy.palette.groups.agents, items: agentItems(model, query, now) },
+    { key: 'projects', label: copy.palette.groups.projects, items: projectItems(model) },
+  ];
+  const task = taskItem(model, ui, query);
+  const ranked = all
+    .filter((g) => scope === 'all' || g.key === scope)
+    .map((g) => ({ ...g, items: rank(g.items, query) }));
+  // A sentence leads the list; a word or two is a command (or nothing).
+  const offer = task !== null && task.lead;
+  let first = true;
+  return ranked
+    .map((g) =>
+      g.key !== 'actions' || !offer || task === null ? g : { ...g, items: [task.item, ...g.items] },
+    )
+    .filter((g) => g.items.length > 0)
+    .map((g) => ({
+      ...g,
+      items: g.items.map((item) => {
+        const flagged = { ...item, first };
+        first = false;
+        return flagged;
+      }),
+    }));
+};
+
+export const flattenPalette = (groups: readonly PaletteGroup[]): PaletteItem[] =>
+  groups.flatMap((g) => g.items);

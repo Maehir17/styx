@@ -1,0 +1,559 @@
+import { describe, expect, it } from 'vitest';
+import { idFrom } from '../ids';
+import type { GrantId, SessionId } from '../ids';
+import { DEMO_NOW, demoReadModel, errorReadModel, ids } from '../fixtures/demo';
+import type { AuditEntry } from '../model/audit';
+import type { Grant } from '../model/grant';
+import type { PendingAsk } from '../model/session';
+import type { ReadModel } from '../read-model';
+import { removeRows, rows, tableFrom, upsertRows } from '../read-model';
+import { AGENT_LABEL } from '../model/common';
+import { auditDetailRows, auditRow, auditRows, auditWhat, canRevokeFromAudit } from './audit';
+import { headlineScope, inboxRows, inboxTabLabel, inboxTargetLabel, toastFor } from './inbox';
+import { DEPLOYABLE_PROVIDERS, flattenPalette, nextPaletteScope, paletteResults } from './palette';
+
+const NOW = DEMO_NOW;
+const MIN = 60_000;
+
+describe('auditRows (prototype audit log)', () => {
+  const model = demoReadModel();
+  it('renders the prototype rows newest first', () => {
+    expect(auditRows(model, NOW).map((r) => `${r.t} ${r.who} ${r.target} ${r.what}`)).toEqual([
+      '09:41 Claude vercel-prod used deploy token (auto: policy #1)',
+      '09:12 you vercel-prod granted deploy to Claude · 1h',
+      '08:58 system aws-acme-prod revoked Gemini grant · idle 1h',
+      '08:30 Cursor github opened PR #212',
+    ]);
+  });
+  it('a row within the last minute reads "now"', () => {
+    const entries = rows(model.auditEntries);
+    const granted = entries.find((e) => e.action === 'granted') as AuditEntry;
+    const fresh: AuditEntry = {
+      ...granted,
+      id: idFrom<'AuditId'>('a-now'),
+      seq: 99,
+      time: NOW - 5_000,
+      agent: 'codex',
+      scope: ['read', 'write'],
+      targetLabel: 'supabase-prod',
+    };
+    expect(auditRow({ ...fresh, targetLabel: null }, rows(model.policies), NOW).target).toBe('—');
+    expect(auditRow(fresh, rows(model.policies), NOW)).toMatchObject({
+      t: 'now',
+      who: 'you',
+      what: 'granted read+write to Codex · 1h',
+    });
+  });
+  it('every action kind has a label', () => {
+    const base = rows(model.auditEntries).find((e) => e.action === 'used') as AuditEntry;
+    const policies = rows(model.policies);
+    const at = (over: Partial<AuditEntry>): string => auditWhat({ ...base, ...over }, policies);
+    expect(at({ policyId: null })).toBe('used deploy token');
+    expect(at({ action: 'denied', scope: ['write'] })).toBe('denied write to Claude');
+    expect(at({ action: 'requested', scope: ['read', 'write'] })).toBe('requested read+write');
+    expect(at({ action: 'revoked', detail: { reason: 'user' } })).toBe(
+      'revoked Claude grant · revoked by you',
+    );
+    expect(at({ action: 'revoked', detail: {}, triggeredBy: 'lock glyph' })).toBe(
+      'revoked Claude grant · lock glyph',
+    );
+    expect(at({ action: 'revoked', detail: {}, triggeredBy: null })).toBe('revoked Claude grant · —');
+    expect(at({ action: 'revoked', detail: { reason: 'not-a-reason' }, triggeredBy: null })).toBe(
+      'revoked Claude grant · —',
+    );
+    expect(at({ action: 'expired', detail: { reason: 'expired' }, agent: null, actorLabel: 'system' })).toBe(
+      'revoked system grant · expired',
+    );
+    expect(at({ action: 'granted', duration: null })).toBe('granted deploy to Claude · —');
+    expect(at({ action: 'granted', scope: null })).toBe('granted  to Claude · 1h');
+    const auto = policies.find((p) => p.ord === 1);
+    expect(at({ action: 'granted', policyId: auto?.id ?? null, detail: { decidedBy: 'policy' } })).toBe(
+      'granted deploy to Claude · 1h (auto: policy #1)',
+    );
+    expect(at({ action: 'granted', policyId: null, detail: { decidedBy: 'policy' } })).toBe(
+      'granted deploy to Claude · 1h',
+    );
+    expect(at({ action: 'merged-pr', detail: { prNumber: '7' } })).toBe('merged PR #7');
+    expect(at({ action: 'opened-pr', detail: {} })).toBe('opened PR #?');
+    expect(at({ action: 'connected' })).toBe('connected');
+    expect(at({ action: 'disconnected' })).toBe('disconnected');
+    expect(at({ action: 'tested' })).toBe('tested connection');
+    expect(at({ action: 'policy-changed' })).toBe('changed policies');
+    expect(at({ action: 'exported' })).toBe('exported audit log');
+  });
+  it('detail rows for the drawer', () => {
+    const policies = rows(model.policies);
+    const granted = rows(model.auditEntries).find((e) => e.action === 'granted') as AuditEntry;
+    expect(auditDetailRows(granted, policies).map((r) => [r.k, r.v])).toEqual([
+      ['Actor', 'you'],
+      ['Target', 'vercel-prod'],
+      ['Scope', 'deploy'],
+      ['Duration', '1h · expires 10:12'],
+      ['Session', 'claude · acme-shop'],
+      ['Worktree', 'fix/checkout'],
+      ['Triggered by', 'grant sheet'],
+      ['Policy', '#2 ask + MFA'],
+    ]);
+    const used = rows(model.auditEntries).find((e) => e.action === 'used') as AuditEntry;
+    expect(auditDetailRows(used, policies).map((r) => r.v)).toEqual([
+      'Claude',
+      'vercel-prod',
+      'deploy',
+      'policy · single use',
+      'claude · acme-shop',
+      'fix/checkout',
+      '$ vercel deploy --prod',
+      '#1 auto-approve staging reads',
+    ]);
+    const expired = rows(model.auditEntries).find((e) => e.action === 'expired') as AuditEntry;
+    expect(auditDetailRows(expired, policies).map((r) => r.v)).toEqual([
+      'system',
+      'aws-acme-prod',
+      'read',
+      '—',
+      'gemini · acme-shop',
+      'main',
+      'idle timer',
+      '#3 idle expiry',
+    ]);
+    const custom = policies.map((p) => ({ ...p, builtinKey: null, ruleText: 'Deny deploys after 18:00' }));
+    expect(auditDetailRows(granted, custom)[7]?.v).toBe('#2 Deny deploys after 18:00');
+    const bare: AuditEntry = {
+      ...used,
+      action: 'used',
+      policyId: null,
+      scope: null,
+      sessionLabel: null,
+      worktreeLabel: null,
+      triggeredBy: null,
+      targetLabel: null,
+      duration: null,
+    };
+    expect(auditDetailRows(bare, policies).map((r) => r.v)).toEqual([
+      'Claude',
+      '—',
+      '—',
+      '—',
+      '—',
+      '—',
+      '—',
+      '—',
+    ]);
+    const sessionGrant: AuditEntry = { ...granted, duration: 'session' };
+    expect(auditDetailRows(sessionGrant, policies)[3]?.v).toBe('session');
+  });
+  it('Revoke now is enabled only for active user-issued grants', () => {
+    const entries = rows(model.auditEntries);
+    const granted = entries.find((e) => e.action === 'granted') as AuditEntry;
+    const expired = entries.find((e) => e.action === 'expired') as AuditEntry;
+    const opened = entries.find((e) => e.action === 'opened-pr') as AuditEntry;
+    expect(canRevokeFromAudit(granted, model)).toBe(true);
+    expect(canRevokeFromAudit(expired, model)).toBe(false);
+    expect(canRevokeFromAudit(opened, model)).toBe(false);
+    expect(canRevokeFromAudit({ ...granted, grantId: idFrom<'GrantId'>('nope') as GrantId }, model)).toBe(
+      false,
+    );
+    const g = model.grants.byId[ids.grant.vercelProdClaude] as Grant;
+    const systemIssued = {
+      ...model,
+      grants: upsertRows(model.grants, [{ ...g, decidedBy: 'policy' as const }]),
+    };
+    expect(canRevokeFromAudit(granted, systemIssued)).toBe(false);
+  });
+});
+
+describe('inbox', () => {
+  const model = demoReadModel();
+  it('three requests, newest first, with env/scope/reason/age', () => {
+    expect(
+      inboxRows(model, NOW).map((r) => [
+        r.agent,
+        r.project,
+        r.target,
+        r.env,
+        r.prod,
+        r.scope,
+        r.reason,
+        r.age,
+      ]),
+    ).toEqual([
+      ['Codex', 'acme-shop', 'Supabase prod', 'prod', true, 'write', 'migration 0042', '3m'],
+      ['Claude', 'infra-tools', 'AWS acme-prod', 'prod', true, 'read', 'list ECS services', '9m'],
+      ['Cursor', 'blog-v2', 'Vercel', 'preview', false, 'deploy', 'preview deploy for #88', '14m'],
+    ]);
+    expect(inboxRows(model, NOW)[0]?.scopes).toEqual(['read', 'write']);
+    expect(inboxTabLabel(model, NOW)).toBe('Requests · 3');
+  });
+  it('headline scope and target label', () => {
+    expect(headlineScope(['read', 'delete'])).toBe('delete');
+    expect(headlineScope([])).toBe('');
+    expect(inboxTargetLabel({ name: 'Supabase', provider: 'supabase', env: 'staging' })).toBe('Supabase');
+    expect(inboxTargetLabel({ name: 'Supabase', provider: 'supabase', env: 'prod' })).toBe('Supabase prod');
+    expect(inboxTargetLabel({ name: 'AWS acme-prod', provider: 'aws', env: 'prod' })).toBe('AWS acme-prod');
+  });
+  it('drops requests whose target is gone; no session → —', () => {
+    const noTarget = { ...model, targets: removeRows(model.targets, [ids.target.infraAws]) };
+    expect(inboxRows(noTarget, NOW)).toHaveLength(2);
+    const g = model.grants.byId[ids.grant.awsClaude] as Grant;
+    const detached = { ...model, grants: upsertRows(model.grants, [{ ...g, sessionId: null }]) };
+    expect(inboxRows(detached, NOW)[1]?.agent).toBe('—');
+  });
+  it('toast copy for the Codex request', () => {
+    expect(toastFor(model, ids.grant.supabaseCodex)).toEqual({
+      header: 'Needs you',
+      source: 'Styx · now',
+      title: 'Codex wants Supabase prod · write',
+      meta: 'acme-shop · test/flaky · "migration 0042"',
+      review: 'Review',
+      later: 'Later',
+    });
+    expect(toastFor(model, ids.grant.awsClaude)?.title).toBe('Claude wants AWS acme-prod prod · read');
+  });
+  it('toast is null without a grant, session or target', () => {
+    expect(toastFor(model, idFrom<'GrantId'>('nope') as GrantId)).toBeNull();
+    expect(toastFor(model, ids.grant.vercelPreviewAlways)).toBeNull();
+    expect(
+      toastFor(
+        { ...model, sessions: removeRows(model.sessions, [ids.session.codex]) },
+        ids.grant.supabaseCodex,
+      ),
+    ).toBeNull();
+    expect(
+      toastFor(
+        { ...model, targets: removeRows(model.targets, [ids.target.supabaseProd]) },
+        ids.grant.supabaseCodex,
+      ),
+    ).toBeNull();
+  });
+});
+
+describe('paletteResults', () => {
+  const model = demoReadModel();
+  const ui = { projectId: ids.project.acmeShop };
+  const flat = (m: ReadModel, q = '', scope: 'all' | 'actions' | 'agents' | 'projects' = 'all') =>
+    flattenPalette(paletteResults(m, ui, q, scope, NOW)).map((i) => `${i.glyph} ${i.label} · ${i.meta}`);
+
+  it('Start as a task (ADR-0027): first for a sentence; not for a word or two, which are commands', () => {
+    const sentence = paletteResults(model, ui, 'add tests for the promo banner', 'all', NOW);
+    const top = sentence[0]?.items[0];
+    expect(top).toMatchObject({
+      id: 'new-task',
+      glyph: '+',
+      label: 'Start “add tests for the promo banner” as a task in acme-shop',
+      meta: 'New task',
+      first: true,
+      action: { kind: 'new-task', projectId: ids.project.acmeShop, text: 'add tests for the promo banner' },
+    });
+    expect(
+      flattenPalette(paletteResults(model, ui, 'deploy', 'all', NOW)).some((i) => i.id === 'new-task'),
+    ).toBe(false);
+    expect(paletteResults(model, ui, 'qqzz xx', 'all', NOW)).toEqual([]);
+    expect(
+      flattenPalette(paletteResults(model, ui, 'a b', 'all', NOW)).some((i) => i.id === 'new-task'),
+    ).toBe(false);
+    expect(
+      flattenPalette(paletteResults(model, { projectId: null }, 'add some tests now', 'all', NOW)).some(
+        (i) => i.id === 'new-task',
+      ),
+    ).toBe(false);
+    // Only in the Actions scope (or all).
+    expect(
+      flattenPalette(paletteResults(model, ui, 'add some tests now', 'agents', NOW)).some(
+        (i) => i.id === 'new-task',
+      ),
+    ).toBe(false);
+    expect(flattenPalette(paletteResults(model, ui, 'add some tests now', 'actions', NOW))[0]?.id).toBe(
+      'new-task',
+    );
+    const words = `fix the ${'x'.repeat(80)}`;
+    const long = paletteResults(model, ui, words, 'all', NOW)[0]?.items.find((i) => i.id === 'new-task');
+    expect(long?.label.includes('…')).toBe(true);
+    expect(long?.action).toMatchObject({ text: words });
+  });
+
+  it('groups Actions / Agents / Projects with the prototype rows and lock state in meta', () => {
+    const groups = paletteResults(model, ui, '', 'all', NOW);
+    expect(groups.map((g) => g.label)).toEqual(['Actions', 'Agents', 'Projects']);
+    expect(groups[0]?.items.map((i) => `${i.glyph} ${i.label} · ${i.meta}`)).toEqual([
+      '▲ Deploy acme-shop → Vercel prod · open · 58m',
+      '▲ Deploy acme-shop → Vercel preview · always',
+      // Every target is a deploy row (owner principle, AI-native): a target Styx has no command for yet hands the
+      // first deploy to the agent, so it is never missing from the palette.
+      '▲ Deploy acme-shop → Supabase prod · locked',
+      '▲ Deploy acme-shop → AWS acme-prod prod · locked',
+      '▲ Deploy acme-shop → GitHub acme/shop scm · always',
+      '◆ Grant Codex → Supabase prod · needs you',
+      '+ Spawn agent in acme-shop · claude ▾',
+      '■ New project… · empty · template · agent',
+      '■ Add from recent projects… · recents · scan this machine',
+      '■ Open folder… · existing repo',
+      '■ Clone URL… · git clone',
+      '▲ Tech debt audit · review this repo in the background',
+      // Commit, push and PR for the branch the project is on (ADR-0021).
+      '▲ Publish acme-shop · fix/checkout · commit · push · pull request',
+      '■ Open agent dock · all projects · always on top',
+      // Feedback to the owner (discrepancy #123).
+      '■ Send feedback · goes straight to the person who makes Styx',
+      '■ Show the walkthrough · a one-minute tour of the window',
+      // Snake on the tab the pane shows (owner addition, discrepancy #110).
+      '■ Play while you wait · Snake · in the chat pane',
+    ]);
+    expect(groups[1]?.items.map((i) => `${i.glyph} ${i.label} · ${i.meta}`)).toEqual([
+      '● Claude · acme-shop · working',
+      '● Codex · acme-shop · needs you',
+      '● Claude · blog-v2 · needs you',
+      '● Gemini · acme-shop · idle',
+      '● Gemini · infra-tools · working',
+      '● shell · client-x · working',
+    ]);
+    expect(groups[2]?.items.map((i) => `${i.label} · ${i.meta}`)).toEqual([
+      'Switch to acme-shop · fix/checkout',
+      'Switch to blog-v2 · feat/mdx',
+      'Switch to infra-tools · main',
+      'Switch to client-x · main',
+      'Switch to side-api · main',
+    ]);
+    const all = flattenPalette(groups);
+    expect(all.filter((i) => i.first).map((i) => i.label)).toEqual(['Deploy acme-shop → Vercel prod']);
+    expect(all[0]?.action).toEqual({
+      kind: 'deploy',
+      projectId: ids.project.acmeShop,
+      targetId: ids.target.vercelProd,
+    });
+    expect(all[5]?.action).toEqual({
+      kind: 'review-ask',
+      sessionId: ids.session.codex,
+      askId: ids.ask.codexGrant,
+    });
+    expect(all[6]?.action).toEqual({ kind: 'spawn', projectId: ids.project.acmeShop });
+    expect(all[7]?.action).toEqual({ kind: 'new-project' });
+    expect(all[8]?.action).toEqual({ kind: 'add-existing' });
+    expect(all[9]?.action).toEqual({ kind: 'open-folder' });
+    expect(all[10]?.action).toEqual({ kind: 'clone-url' });
+    expect(all[11]?.action).toEqual({ kind: 'debt-audit', projectId: ids.project.acmeShop });
+    expect(all[12]?.action).toEqual({
+      kind: 'publish',
+      projectId: ids.project.acmeShop,
+      worktreeId: ids.worktree.fixCheckout,
+    });
+    expect(all[13]?.action).toEqual({ kind: 'agent-dock' });
+    expect(all[14]?.action).toEqual({ kind: 'feedback' });
+    expect(all[15]?.action).toEqual({ kind: 'tour' });
+    expect(all[16]?.action).toEqual({ kind: 'arcade', projectId: ids.project.acmeShop });
+    expect(all[17]?.action).toEqual({ kind: 'open-session', sessionId: ids.session.claude });
+    expect(all[23]?.action).toEqual({ kind: 'switch-project', projectId: ids.project.acmeShop });
+  });
+
+  it('fuzzy on label + meta, best first; the first visible row is flagged; empty groups dropped', () => {
+    const results = paletteResults(model, ui, 'supa', 'all', NOW);
+    // A finished chat whose task mentions it is found too, after the actions.
+    expect(results.map((g) => g.label)).toEqual(['Actions', 'Agents']);
+    expect(results[1]?.items.every((i) => i.label.startsWith('Reopen '))).toBe(true);
+    expect(results[0]?.items.map((i) => [i.label, i.first])).toEqual([
+      ['Grant Codex → Supabase prod', true],
+      ['Deploy acme-shop → Supabase prod', false],
+    ]);
+    expect(flat(model, 'needs you')).toEqual([
+      '◆ Grant Codex → Supabase prod · needs you',
+      '● Codex · acme-shop · needs you',
+      '● Claude · blog-v2 · needs you',
+    ]);
+    expect(flat(model, 'blog')[0]).toBe('● Claude · blog-v2 · needs you');
+    expect(paletteResults(model, ui, 'zzzz', 'all', NOW)).toEqual([]);
+  });
+
+  it('finished chats are found while searching, archived ones reopen first; an empty palette leaves them out', () => {
+    const done = rows(model.sessions).filter((s) => s.state === 'done' && !s.purpose);
+    expect(done.length).toBeGreaterThan(0);
+    const first = done[0];
+    if (!first) throw new Error('fixture');
+    const finished = (m: typeof model, q: string) =>
+      paletteResults(m, ui, q, 'agents', NOW)
+        .flatMap((g) => g.items)
+        .filter((i) => i.id.startsWith('finished:'));
+    expect(finished(model, '')).toEqual([]);
+    const archived = { ...first, archivedAt: NOW, firstMessage: null };
+    const m2 = {
+      ...model,
+      sessions: tableFrom([...rows(model.sessions).filter((s) => s.id !== first.id), archived]),
+    };
+    const hit = finished(m2, 'reopen').find((i) => i.id === `finished:${first.id}`);
+    expect(hit?.action).toEqual({ kind: 'reopen-session', sessionId: first.id });
+    expect(hit?.label.startsWith(`Reopen ${AGENT_LABEL[first.agent]} · `)).toBe(true);
+    const shown = finished(model, 'reopen').find((i) => i.id === `finished:${first.id}`);
+    expect(shown?.action).toEqual({ kind: 'open-session', sessionId: first.id });
+    expect(shown?.meta.startsWith('finished · ')).toBe(true);
+  });
+
+  it('scope filtering (⇥) and scope cycling', () => {
+    expect(paletteResults(model, ui, '', 'agents', NOW).map((g) => g.label)).toEqual(['Agents']);
+    expect(paletteResults(model, ui, '', 'projects', NOW)[0]?.items[0]?.first).toBe(true);
+    expect(flat(model, '', 'actions')).toHaveLength(17);
+    expect(nextPaletteScope('all')).toBe('actions');
+    expect(nextPaletteScope('actions')).toBe('agents');
+    expect(nextPaletteScope('agents')).toBe('projects');
+    expect(nextPaletteScope('projects')).toBe('all');
+  });
+
+  it('without a current project only the project-entry rows remain in Actions', () => {
+    expect(
+      paletteResults(model, { projectId: null }, '', 'actions', NOW)[0]?.items.map((i) => i.label),
+    ).toEqual([
+      'New project…',
+      'Add from recent projects…',
+      'Open folder…',
+      'Clone URL…',
+      // No audit row: it needs a project to audit. The dock and feedback are cross-project, so they stay.
+      'Open agent dock',
+      'Send feedback',
+      'Show the walkthrough',
+    ]);
+  });
+
+  it('offers Snake for the chat pane unless the tab on screen is waiting on the person (discrepancy #110)', () => {
+    const on = (sessionId: SessionId | null) =>
+      flattenPalette(paletteResults(model, { ...ui, sessionId }, '', 'actions', NOW)).filter(
+        (i) => i.action.kind === 'arcade',
+      );
+    const row = { kind: 'arcade', projectId: ids.project.acmeShop };
+    // No tab picked yet: the pane shows the first tab (Claude), so the palette offers the game.
+    expect(on(null).map((i) => i.action)).toEqual([row]);
+    // Codex is needs-you: that ask comes first.
+    expect(on(ids.session.codex)).toEqual([]);
+    // Gemini is idle: the game does not need a running turn.
+    expect(on(ids.session.gemini).map((i) => i.action)).toEqual([row]);
+    // A session of another project is not this project's tab: the first tab here stands in.
+    expect(on(ids.session.blog).map((i) => i.action)).toEqual([row]);
+    expect(on(ids.session.claude).map((i) => `${i.glyph} ${i.label} · ${i.meta}`)).toEqual([
+      '■ Play while you wait · Snake · in the chat pane',
+    ]);
+    // The row is the last action, so the prototype's rows keep their places.
+    const all = flattenPalette(paletteResults(model, ui, '', 'actions', NOW));
+    expect(all.at(-1)?.action.kind).toBe('arcade');
+    expect(flattenPalette(paletteResults(model, ui, 'snake', 'all', NOW))[0]?.label).toBe(
+      'Play while you wait',
+    );
+    // A project with no live tab has no pane to play in.
+    expect(
+      flattenPalette(paletteResults(model, { projectId: ids.project.sideApi }, '', 'actions', NOW)).filter(
+        (i) => i.action.kind === 'arcade',
+      ),
+    ).toEqual([]);
+  });
+
+  it('lock state meta: locked / expired / unconnected, and after the grant', () => {
+    const vercelProd = model.targets.byId[ids.target.vercelProd] as NonNullable<
+      (typeof model.targets.byId)[string]
+    >;
+    const locked = { ...model, grants: removeRows(model.grants, [ids.grant.vercelProdClaude]) };
+    expect(flat(locked, 'vercel prod', 'actions')[0]).toBe('▲ Deploy acme-shop → Vercel prod · locked');
+    const expired = {
+      ...locked,
+      targets: upsertRows(model.targets, [{ ...vercelProd, health: 'expired' as const }]),
+    };
+    expect(flat(expired, 'vercel prod', 'actions')[0]).toBe('▲ Deploy acme-shop → Vercel prod · expired');
+    const unconnected = {
+      ...locked,
+      targets: upsertRows(model.targets, [{ ...vercelProd, credentialRef: null }]),
+    };
+    expect(flat(unconnected, 'vercel prod', 'actions')[0]).toBe(
+      '▲ Deploy acme-shop → Vercel prod · unconnected',
+    );
+    expect(DEPLOYABLE_PROVIDERS).toContain('vercel');
+    expect(flat(errorReadModel(), 'deploy', 'actions')).toHaveLength(5);
+  });
+
+  it('a deploy in flight for the target replaces the lock state with `deploying…`', () => {
+    const deploy = {
+      deployId: 'dep:1',
+      targetId: ids.target.vercelProd,
+      projectId: ids.project.acmeShop,
+      phase: 'running' as const,
+      terminalId: 'term:1',
+      exitCode: null,
+      error: null,
+      startedAt: NOW - MIN,
+      endedAt: null,
+    };
+    const inFlight: ReadModel = { ...model, deploys: { 'dep:1': deploy } };
+    expect(flat(inFlight, 'vercel prod', 'actions')[0]).toBe('▲ Deploy acme-shop → Vercel prod · deploying…');
+    // Other targets keep their own lock state; a finished deploy no longer counts.
+    expect(flat(inFlight, 'vercel preview', 'actions')[0]).toBe(
+      '▲ Deploy acme-shop → Vercel preview · always',
+    );
+    const done: ReadModel = {
+      ...model,
+      deploys: { 'dep:1': { ...deploy, phase: 'succeeded', exitCode: 0, endedAt: NOW } },
+    };
+    expect(flat(done, 'vercel prod', 'actions')[0]).toBe('▲ Deploy acme-shop → Vercel prod · open · 58m');
+  });
+
+  it('grant rows need a grant head ask with a known grant and target', () => {
+    const ask = model.pendingAsks.byId[ids.ask.codexGrant] as PendingAsk;
+    const planAsk: PendingAsk = {
+      ...ask,
+      kind: 'plan',
+      grantId: null,
+      payload: { kind: 'plan', summary: '', files: [] },
+    };
+    expect(
+      flat({ ...model, pendingAsks: upsertRows(model.pendingAsks, [planAsk]) }, 'grant codex', 'actions'),
+    ).toEqual([]);
+    expect(
+      flat(
+        { ...model, pendingAsks: removeRows(model.pendingAsks, [ids.ask.codexGrant]) },
+        'grant codex',
+        'actions',
+      ),
+    ).toEqual([]);
+    expect(
+      flat(
+        { ...model, grants: removeRows(model.grants, [ids.grant.supabaseCodex]) },
+        'grant codex',
+        'actions',
+      ),
+    ).toEqual([]);
+    expect(
+      flat(
+        { ...model, targets: removeRows(model.targets, [ids.target.supabaseProd]) },
+        'grant codex',
+        'actions',
+      ),
+    ).toEqual([]);
+  });
+
+  it('open meta counts down from the target open-until', () => {
+    expect(flat(model, 'vercel prod', 'actions')[0]).toBe('▲ Deploy acme-shop → Vercel prod · open · 58m');
+    expect(flat(model, 'vercel prod', 'actions').length).toBeGreaterThan(0);
+    expect(paletteResults(model, ui, 'vercel prod', 'actions', NOW + 57 * MIN)[0]?.items[0]?.meta).toBe(
+      'open · 1m',
+    );
+  });
+});
+
+describe('palette deploy rows (user deploy commands)', () => {
+  it('a GCP target with a deploy command gets a row like a built-in Vercel one', () => {
+    const m = demoReadModel();
+    const gcp = m.targets.byId[ids.target.infraGcp];
+    if (gcp === undefined) throw new Error('fixture');
+    const withCommand = {
+      ...m,
+      targets: {
+        ...m.targets,
+        byId: {
+          ...m.targets.byId,
+          [gcp.id]: { ...gcp, config: { ...gcp.config, deployCommand: 'gcloud run deploy api --source .' } },
+        },
+      },
+    };
+    const before = paletteResults(m, { projectId: ids.project.infraTools }, '', 'all', DEMO_NOW)
+      .flatMap((g) => g.items)
+      .filter((i) => i.id.startsWith('deploy:'));
+    const after = paletteResults(withCommand, { projectId: ids.project.infraTools }, '', 'all', DEMO_NOW)
+      .flatMap((g) => g.items)
+      .filter((i) => i.id.startsWith('deploy:'));
+    // The row is there either way; with a remembered command it deploys directly, without one the agent works it out.
+    expect(before.map((i) => i.label)).toEqual(after.map((i) => i.label));
+    expect(after.map((i) => i.label)).toContain(`Deploy infra-tools → ${gcp.name} ${gcp.env}`);
+  });
+});

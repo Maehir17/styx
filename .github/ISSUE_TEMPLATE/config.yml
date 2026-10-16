@@ -1,0 +1,8 @@
+blank_issues_enabled: true
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/Maehir17/styx/discussions
+    about: Ask how to do something, share an idea or show what you built.
+  - name: Report a security problem
+    url: https://github.com/Maehir17/styx/blob/main/SECURITY.md
+    about: Please report vulnerabilities privately, not as an issue.

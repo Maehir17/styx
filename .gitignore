@@ -1,0 +1,40 @@
+node_modules/
+dist/
+out/
+build/
+# electron-builder's `build/` is packaging *input*, not output: entitlements, the icon and the notarize hook
+# must be committed or a fresh clone signs without them (an unsigned-JIT build breaks every credential shim).
+!apps/desktop/build/
+apps/desktop/release/
+coverage/
+.dev/
+*.log
+.DS_Store
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+.vite/
+storybook-static/
+apps/desktop/e2e/visual/output/
+test-results/
+playwright-report/
+CLAUDE.local.md
+.claude/settings.local.json
+.planning/.cache/
+apps/desktop/test-results/
+apps/desktop/e2e/test-results/
+apps/desktop/resources/cli/
+.next/
+next-env.d.ts
+.playwright-mcp/
+*.tsbuildinfo
+apps/desktop/e2e/sim/out/
+
+# Roadmap and execution state (gsd) stay on the owner's machine.
+.planning/
+
+# Fumadocs MDX output (apps/website/.source)
+.source/

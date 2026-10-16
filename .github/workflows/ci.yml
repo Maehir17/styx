@@ -1,0 +1,59 @@
+name: ci
+on: [push, pull_request]
+# A newer push to the same branch supersedes a run still in progress.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # The version comes from package.json's packageManager; naming it here too makes the action refuse to run.
+      - uses: pnpm/action-setup@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 22, cache: pnpm }
+      - run: pnpm install --frozen-lockfile
+      # Unpack Electron once: parallel test workers that load it otherwise race its download.
+      - run: node node_modules/electron/install.js
+      - run: pnpm tokens:build
+      - run: pnpm typecheck
+      - run: pnpm lint
+      # One retry for a flaky unit test; vitest marks it in the log ("retry x1").
+      - run: pnpm test --retry=1
+      - run: pnpm build
+      - name: Playwright browsers (Storybook axe + prototype baker)
+        run: npx playwright install --with-deps chromium
+      # The Storybook test runner sometimes crashes while starting on Windows ("Cannot access
+      # 'StorybookTestRunnerError' before initialization"); one retry, so a startup race can't block a merge.
+      - name: Storybook axe (one retry)
+        shell: bash
+        run: pnpm -F @styx/ui storybook:test || { echo "::warning::Storybook test run failed; retrying once"; pnpm -F @styx/ui storybook:test; }
+      - name: Electron e2e (main window, shell, grant flow, a11y)
+        if: runner.os == 'macOS'
+        run: pnpm e2e
+      # The runner's virtual display is 1024×768, smaller than Styx's 1280×800 window, and Windows keeps windows on
+      # screen: a shrunken window changes the layout under test (the terminal overlaps the footer, lists scroll).
+      - name: Display large enough for the window (Windows)
+        if: runner.os == 'Windows'
+        run: Set-DisplayResolution -Width 1920 -Height 1080 -Force
+      - name: Electron e2e on Windows (main window, shell, grant flow, a11y)
+        if: runner.os == 'Windows'
+        run: pnpm e2e
+      # Linux runs Electron under a virtual display large enough for the 1280×800 window.
+      - name: Electron e2e on Linux (main window, shell, grant flow, a11y)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a -s "-screen 0 1920x1080x24" pnpm e2e
+      - name: Packaged app smoke (unsigned)
+        if: runner.os == 'macOS'
+        run: pnpm -F @styx/desktop package:mac:dir && pnpm -F @styx/desktop package:smoke
+      - name: Packaged app smoke on Windows (unsigned)
+        if: runner.os == 'Windows'
+        run: pnpm -F @styx/desktop package:win:dir && pnpm -F @styx/desktop package:smoke
+      - name: Packaged app smoke on Linux
+        if: runner.os == 'Linux'
+        run: pnpm -F @styx/desktop package:linux:dir && xvfb-run -a -s "-screen 0 1920x1080x24" pnpm -F @styx/desktop package:smoke

@@ -1,0 +1,36 @@
+@layer components {
+  .tag {
+    /* inline like the prototype's spans: padding/border must not enlarge the parent line box */
+    display: inline;
+    font-family: var(--font-ui);
+    font-size: 11px;
+    font-weight: 700;
+    white-space: nowrap;
+    padding: 1px 5px;
+    border: 1px solid var(--ln);
+    border-radius: 0;
+  }
+  .neutral,
+  .accent,
+  .strong {
+    /* base recipe */
+  }
+  .agent {
+    font-weight: 600;
+    padding: 1px 4px;
+  }
+  .strong {
+    border-color: var(--tx);
+  }
+  .md {
+    font-size: 10px;
+    padding: 2px 6px;
+  }
+  .md.neutral {
+    font-weight: 600;
+    color: var(--mu);
+  }
+  .md.agent {
+    padding: 2px 6px;
+  }
+}

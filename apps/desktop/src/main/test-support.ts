@@ -79,6 +79,8 @@ export interface TestAppOptions {
   /** The merge resolver's checks runner and Mergiraf hook (ADR-0025 phase B); tests fake both. */
   runChecks?: (cwd: string, command: string) => Promise<{ exitCode: number; output: string }>;
   mergiraf?: (file: string, cwd: string) => Promise<boolean>;
+  /** Where chat import looks for Claude Code / Codex chats; tests point it at a temp home, never the real one. */
+  chatHistory?: { home: string; env: NodeJS.ProcessEnv };
 }
 
 /** An in-memory app: SQLite `:memory:`, MemoryVault, FakeMfa, no Electron, one registered fake window. */
@@ -138,6 +140,7 @@ export function makeTestApp(opts: TestAppOptions = {}): TestApp {
     ...(opts.pty ? { pty: opts.pty } : {}),
     ...(opts.stream ? { stream: opts.stream } : {}),
     ...(opts.detect ? { detect: opts.detect } : {}),
+    ...(opts.chatHistory ? { chatHistory: opts.chatHistory } : {}),
     ...(opts.exec ? { exec: opts.exec } : {}),
     ...(opts.probe ? { probe: opts.probe } : {}),
     deviceWhich: opts.deviceWhich ?? (async () => null),

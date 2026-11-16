@@ -15,6 +15,17 @@ export function registerSessionCommands(bus: CommandBus, app: Container): void {
     return result;
   });
 
+  bus.register('session.importableChats', async ({ projectId }) => ({
+    chats: await sessions.importableChats(projectId),
+  }));
+
+  bus.register('session.importChat', async (input) => {
+    app.projects.refreshFromFile(input.projectId);
+    const result = await sessions.importChat(input);
+    app.usageReports.record('agent.spawned');
+    return result;
+  });
+
   // Queue (Claude Code has no steer): filled by the queue work package in SessionService.
   bus.register('session.sendQueued', async ({ sessionId, messageId }) => {
     await sessions.sendQueued(sessionId, messageId);

@@ -1996,6 +1996,27 @@ Reply in chat. Don't write a file, open a PR, or produce a plan document. Use ex
     sourceRecents: 'editor recents',
   },
 
+  /** Bringing a chat started outside Styx (Claude Code, Codex) into a task. */
+  importChat: {
+    action: 'Import a chat',
+    title: 'Import a chat',
+    lead: 'Carry on a conversation you had with Claude Code or Codex in this project. It opens as a task on its own branch, with the chat as it was, and the agent remembers it.',
+    loading: 'Looking for chats…',
+    empty: 'No Claude Code or Codex chats for this project on this computer.',
+    failed: 'Could not read your chats: {message}',
+    import: 'Import',
+    importing: 'Importing…',
+    /** Row meta: which CLI and when the chat last moved (`formatAge`). */
+    updated: '{agent} · {age} ago',
+    updatedNow: '{agent} · just now',
+    gone: 'That chat is no longer on this computer.',
+    tooLarge: 'That chat is too large to import.',
+    noMessages: 'That chat has nothing in it to bring over.',
+    needsUpdate:
+      '{agent} on this computer is too old to carry on its chats in Styx. Update it, then try again.',
+    activity: '{project} · imported a chat',
+  },
+
   window: { popout: '⤢', dock: 'Dock', minimize: '─', maximize: '☐', close: '✕' },
 
   /** Agent Client Protocol runner (Gemini CLI `--acp`, Cursor `agent acp`; ADR-0017): transcript and terminal lines. */

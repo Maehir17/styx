@@ -89,6 +89,11 @@ export function SpawnModal({ id, projectId }: SpawnModalProps) {
     close();
     openInstallGuide();
   };
+  /** A chat from Claude Code or Codex instead of a new one: the Import a chat list for this project. */
+  const importChat = () => {
+    close();
+    pushOverlay({ kind: 'modal', modal: 'import-chat', projectId });
+  };
   /** Connect agent modal for this CLI; it re-opens this Spawn modal for the project when done. */
   const fixConnection = () => {
     const invoker = invokerOf(id);
@@ -112,6 +117,9 @@ export function SpawnModal({ id, projectId }: SpawnModalProps) {
       initialFocus={chosenTile}
       footer={
         <>
+          <Button size="footer" variant="ghost" onClick={importChat}>
+            {copy.importChat.action}
+          </Button>
           <Button size="footer" variant="ghost" onClick={close}>
             {copy.spawn.cancel}
           </Button>

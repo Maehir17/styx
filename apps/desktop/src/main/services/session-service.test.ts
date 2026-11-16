@@ -1,10 +1,21 @@
+import { execFileSync } from 'node:child_process';
 import { EventEmitter } from 'node:events';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { ATTACHMENTS_DIR, copy, fixtures, MAX_FILE_ATTACHMENT_BYTES, MAX_UPLOAD_BYTES } from '@styx/core';
+import {
+  ATTACHMENTS_DIR,
+  copy,
+  fill,
+  fixtures,
+  MAX_FILE_ATTACHMENT_BYTES,
+  MAX_UPLOAD_BYTES,
+  type CommandOutput,
+  type ProjectId,
+} from '@styx/core';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { makeTestApp, type TestApp } from '../test-support';
+import { claudeProjectKey, claudeSessionFile } from './chat-import';
 import { PtyService } from './pty-service';
 import { parseCliOutdated, runnerFor, STREAM_ACTIVITY_MS, STREAM_FLUSH_MS } from './session-service';
 import type {
@@ -2791,5 +2802,165 @@ describe('SessionService queue (a message sent mid-turn is never dropped)', () =
     expect(a.repos.transcripts.last(session.id).map((m) => m.body)).toContain('late');
     expect(stream.spawned).toHaveLength(2);
     expect(stream.sent.at(-1)?.text).toContain('late');
+  });
+});
+
+describe('importing a chat started outside Styx', () => {
+  const CHAT_ID = '6f1c2d3e-aaaa-bbbb-cccc-000000000001';
+  const CODEX_ID = '0199aa00-1111-2222-3333-444455556666';
+  const at = (s: number): string => new Date(DEMO_NOW - 86_400_000 + s * 1000).toISOString();
+  const lines = (records: unknown[]): string => records.map((r) => JSON.stringify(r)).join('\n') + '\n';
+
+  /** A real git project (a lane is cut from it) and a temp home holding the CLIs' chats for it. */
+  const setup = async () => {
+    const home = mkdtempSync(join(tmpdir(), 'styx-chat-home-'));
+    const dir = mkdtempSync(join(tmpdir(), 'styx-chat-proj-'));
+    writeFileSync(join(dir, 'README.md'), 'hi\n');
+    const git = (...args: string[]) => execFileSync('git', args, { cwd: dir, stdio: 'ignore' });
+    git('init', '-q', '-b', 'main');
+    git('-c', 'user.name=t', '-c', 'user.email=t@example.com', 'commit', '-q', '--allow-empty', '-m', 'init');
+    pty = new FakePty();
+    stream = new FakeStream();
+    t = makeTestApp({ pty, stream, chatHistory: { home, env: {} } });
+    const added = await t.app.bus.dispatch(sender, 'project.add', { path: dir });
+    if (!added.ok) throw new Error(added.error.message);
+    const projectId = added.value.projectId;
+    if (projectId === undefined) throw new Error('no project');
+    const path = t.app.repos.projects.get(projectId)?.path ?? dir;
+    return { app: t.app, home, projectId, path };
+  };
+
+  const importInput = (projectId: ProjectId, source: 'claude' | 'codex', chatId: string, branch: string) => ({
+    projectId,
+    source,
+    chatId,
+    worktree: { kind: 'new' as const, base: 'main', branch },
+    toggles: { autoApproveEdits: false, mayRequestTargets: true, notifyWhenNeedsMe: true },
+    model: null,
+  });
+
+  it('a Claude Code chat becomes a task with its conversation, resumed by id from a copy filed under the lane', async () => {
+    const { app: a, home, projectId, path } = await setup();
+    const dir = join(home, '.claude', 'projects', claudeProjectKey(path));
+    mkdirSync(dir, { recursive: true });
+    const chat = lines([
+      {
+        type: 'user',
+        cwd: path,
+        timestamp: at(1),
+        message: { role: 'user', content: 'Fix the flaky order test' },
+      },
+      {
+        type: 'assistant',
+        cwd: path,
+        timestamp: at(2),
+        message: { id: 'm1', role: 'assistant', content: [{ type: 'text', text: 'Fixed it.' }] },
+      },
+    ]);
+    writeFileSync(join(dir, `${CHAT_ID}.jsonl`), chat);
+
+    const listed = await a.bus.dispatch(sender, 'session.importableChats', { projectId });
+    expect(listed).toMatchObject({
+      ok: true,
+      value: { chats: [{ source: 'claude', id: CHAT_ID, title: 'Fix the flaky order test' }] },
+    });
+    expect(JSON.stringify(listed)).not.toContain('.jsonl'); // where it lives stays in main
+
+    const r = await a.bus.dispatch(
+      sender,
+      'session.importChat',
+      importInput(projectId, 'claude', CHAT_ID, 'agent/claude-1'),
+    );
+    if (!r.ok) throw new Error(r.error.message);
+    const out = r.value as CommandOutput<'session.importChat'>;
+    const session = a.sessions.require(out.sessionId);
+    const worktree = a.repos.worktrees.get(out.worktreeId);
+    expect(session).toMatchObject({
+      agent: 'claude',
+      cliSessionId: CHAT_ID,
+      firstMessage: 'Fix the flaky order test',
+      lastActivityAt: Date.parse(at(2)),
+      state: 'idle',
+    });
+    expect(worktree?.branch).toBe('agent/claude-1');
+    // The chat reads as it did, at its own times.
+    expect(a.repos.transcripts.last(session.id).map((m) => [m.payload.kind, m.body, m.createdAt])).toEqual([
+      ['user', 'Fix the flaky order test', Date.parse(at(1))],
+      ['agent', 'Fixed it.', Date.parse(at(2))],
+    ]);
+    // The first launch resumes the old conversation and sends nothing of its own.
+    expect(stream.spawned).toHaveLength(1);
+    const launched = stream.spawned[0];
+    expect(launched?.args[(launched?.args.indexOf('--resume') ?? -2) + 1]).toBe(CHAT_ID);
+    expect(launched?.firstMessage).toBeNull();
+    expect(launched?.cwd).toBe(worktree?.path);
+    // Claude Code looks for the session under the lane's folder: a copy is there, the original untouched.
+    expect(readFileSync(claudeSessionFile(home, {}, worktree?.path ?? '', CHAT_ID), 'utf8')).toBe(chat);
+    expect(readFileSync(join(dir, `${CHAT_ID}.jsonl`), 'utf8')).toBe(chat);
+    expect(a.repos.activity.recent(1)[0]).toMatchObject({ who: 'Claude', sessionId: session.id });
+  });
+
+  it('a Codex chat resumes its thread; an unknown chat is refused and starts nothing', async () => {
+    const { app: a, home, projectId, path } = await setup();
+    const day = join(home, '.codex', 'sessions', '2026', '03', '11');
+    mkdirSync(day, { recursive: true });
+    writeFileSync(
+      join(day, 'rollout-2026-03-11T09-00-00-abc.jsonl'),
+      lines([
+        { timestamp: at(0), type: 'session_meta', payload: { id: CODEX_ID, cwd: path } },
+        {
+          timestamp: at(1),
+          type: 'response_item',
+          payload: {
+            type: 'message',
+            role: 'user',
+            content: [{ type: 'input_text', text: 'Add validation' }],
+          },
+        },
+        {
+          timestamp: at(2),
+          type: 'response_item',
+          payload: { type: 'message', role: 'assistant', content: [{ type: 'output_text', text: 'Done.' }] },
+        },
+      ]),
+    );
+
+    expect(
+      await a.bus.dispatch(
+        sender,
+        'session.importChat',
+        importInput(projectId, 'codex', '0199aa00-ffff-ffff-ffff-ffffffffffff', 'agent/codex-1'),
+      ),
+    ).toMatchObject({ ok: false, error: { code: 'not-found', message: copy.importChat.gone } });
+    expect(stream.spawned).toHaveLength(0);
+
+    // A Codex too old for its app-server would start a fresh chat in the terminal: refused rather than lose it.
+    expect(
+      await a.bus.dispatch(
+        sender,
+        'session.importChat',
+        importInput(projectId, 'codex', CODEX_ID, 'agent/codex-1'),
+      ),
+    ).toMatchObject({
+      ok: false,
+      error: { code: 'invalid-input', message: fill(copy.importChat.needsUpdate, { agent: 'Codex' }) },
+    });
+    const cli = a.repos.discovery.cli('codex');
+    if (cli) a.repos.discovery.saveCli({ ...cli, capabilities: { ...cli.capabilities, appServer: true } });
+
+    const r = await a.bus.dispatch(
+      sender,
+      'session.importChat',
+      importInput(projectId, 'codex', CODEX_ID, 'agent/codex-1'),
+    );
+    if (!r.ok) throw new Error(r.error.message);
+    const out = r.value as CommandOutput<'session.importChat'>;
+    expect(a.sessions.require(out.sessionId)).toMatchObject({
+      agent: 'codex',
+      cliSessionId: CODEX_ID,
+      firstMessage: 'Add validation',
+    });
+    expect(a.repos.transcripts.last(out.sessionId).map((m) => m.body)).toEqual(['Add validation', 'Done.']);
+    expect(stream.spawned[0]?.session?.resumeSessionId).toBe(CODEX_ID);
   });
 });

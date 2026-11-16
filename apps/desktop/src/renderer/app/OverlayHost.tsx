@@ -15,6 +15,7 @@ import { PolicyRuleModal } from '../features/modals/PolicyRuleModal';
 import { SignInModal } from '../features/modals/SignInModal';
 import { UpdateModal } from '../features/modals/UpdateModal';
 import { FeedbackModal } from '../features/modals/FeedbackModal';
+import { ImportChatModal } from '../features/modals/ImportChatModal';
 import { SpawnModal } from '../features/modals/SpawnModal';
 import { Palette } from '../features/palette/Palette';
 import { SkillDrawer } from '../features/skills/SkillDrawer';
@@ -37,6 +38,8 @@ const render = (o: Overlay) => {
           return <NewProjectModal key={o.id} id={o.id} {...(o.mode !== undefined ? { mode: o.mode } : {})} />;
         case 'add-existing':
           return <AddExistingModal key={o.id} id={o.id} />;
+        case 'import-chat':
+          return <ImportChatModal key={o.id} id={o.id} projectId={o.projectId} />;
         case 'deploy':
           return (
             <DeployModal

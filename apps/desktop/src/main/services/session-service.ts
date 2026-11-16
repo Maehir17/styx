@@ -1,7 +1,15 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
 import { rm } from 'node:fs/promises';
 import { join, resolve, sep } from 'node:path';
+import {
+  listImportableChats,
+  placeClaudeSession,
+  readImportableChat,
+  type ChatImportDeps,
+  type ImportSource,
+} from './chat-import';
 import { z } from 'zod';
 import {
   type AgentProblem,
@@ -112,6 +120,28 @@ export interface SessionServiceDeps {
     userData: string;
     platform: NodeJS.Platform;
   };
+  /** Where Claude Code and Codex keep their chats (`~`, `$CLAUDE_CONFIG_DIR`, `$CODEX_HOME`); defaults to this machine's. */
+  chatHistory?: { home: string; env: NodeJS.ProcessEnv };
+}
+
+/** A past Claude Code / Codex chat to bring in as a task: the spawn form's lane settings plus which chat. */
+export interface ImportChatInput {
+  projectId: string;
+  source: ImportSource;
+  chatId: string;
+  worktree: { kind: 'new'; base: string; branch: string };
+  toggles: SessionToggles;
+  model: string | null;
+  permissionMode?: PermissionMode;
+  effort?: Effort | null;
+}
+
+/** Extra spawn steps for a task that continues an existing CLI session (an imported chat). */
+interface SpawnOptions {
+  /** The CLI's own session id: the first launch already resumes it. */
+  cliSessionId?: string;
+  /** Runs after the session and worktree exist and before the CLI starts. */
+  beforeLaunch?: (session: Session, worktree: Worktree) => Promise<void>;
 }
 
 /** Late-bound collaborators (GrantService, HunkService and the broker host depend on SessionService in turn). */
@@ -489,7 +519,10 @@ export class SessionService {
     return { sessionId: session.id, worktreeId: worktree.id };
   }
 
-  async spawn(input: SpawnInput): Promise<{ session: Session; worktree: Worktree; token: string }> {
+  async spawn(
+    input: SpawnInput,
+    opts: SpawnOptions = {},
+  ): Promise<{ session: Session; worktree: Worktree; token: string }> {
     const { repos, clock } = this.deps;
     const project =
       repos.projects.get(input.projectId) ?? fail('not-found', `project ${input.projectId} not found`);
@@ -565,7 +598,7 @@ export class SessionService {
       model: input.model,
       permissionMode: input.permissionMode ?? 'default',
       effort: input.effort ?? null,
-      cliSessionId: null,
+      cliSessionId: opts.cliSessionId ?? null,
       costUsd: 0,
       numTurns: 0,
       slashCommands: [],
@@ -618,9 +651,91 @@ export class SessionService {
       sessionId: session.id,
     });
 
-    await this.launch(session, worktree, project, token);
+    if (opts.beforeLaunch) await opts.beforeLaunch(this.require(session.id), worktree);
+    // A continued session's first launch resumes it and replays nothing (its first message is the old chat's).
+    await this.launch(this.require(session.id), worktree, project, token, {
+      replayFirstMessage: opts.cliSessionId === undefined,
+    });
     this.hooks?.watchWorktree(this.require(session.id), worktree);
     return { session: this.require(session.id), worktree, token };
+  }
+
+  // --- imported chats --------------------------------------------------------
+
+  private chatImportDeps(): ChatImportDeps {
+    const h = this.deps.chatHistory;
+    return { home: h?.home ?? homedir(), env: h?.env ?? process.env, now: this.deps.clock.now() };
+  }
+
+  /** This project's past Claude Code and Codex chats, newest first (where they live stays in main). */
+  async importableChats(
+    projectId: string,
+  ): Promise<{ source: ImportSource; id: string; title: string; startedAt: number; updatedAt: number }[]> {
+    const project =
+      this.deps.repos.projects.get(projectId) ?? fail('not-found', `project ${projectId} not found`);
+    const chats = await listImportableChats(this.chatImportDeps(), project.path);
+    return chats.map(({ source, id, title, startedAt, updatedAt }) => ({
+      source,
+      id,
+      title,
+      startedAt,
+      updatedAt,
+    }));
+  }
+
+  /**
+   * Brings a chat started outside Styx into a task: the CLI's own session file becomes the transcript (original
+   * times, the same rows a live chat makes), and the task's first launch resumes that session by its id, so the
+   * agent remembers everything and the next message carries on from there.
+   */
+  async importChat(input: ImportChatInput): Promise<{ sessionId: SessionId; worktreeId: WorktreeId }> {
+    const { repos, publisher, transcript } = this.deps;
+    const project =
+      repos.projects.get(input.projectId) ?? fail('not-found', `project ${input.projectId} not found`);
+    const deps = this.chatImportDeps();
+    // Converted against the project folder: the chat's absolute paths are under it, and lane paths mirror it.
+    const read = await readImportableChat(deps, project.path, input.source, input.chatId, project.path).catch(
+      (e: Error) =>
+        fail('invalid-input', e.message === 'chat-too-large' ? copy.importChat.tooLarge : e.message),
+    );
+    if (read === null) fail('not-found', copy.importChat.gone);
+    // Only the stream runners resume a CLI's own session; the terminal fallback would quietly start a fresh chat.
+    if (runnerFor(input.source, repos.discovery.cli(input.source)) !== 'stream')
+      fail('invalid-input', fill(copy.importChat.needsUpdate, { agent: AGENT_LABEL[input.source] }));
+    const rows = read.chat.rows;
+    if (rows.length === 0) fail('invalid-input', copy.importChat.noMessages);
+    const firstUser = rows.find((r) => r.payload.kind === 'user')?.body ?? null;
+    const lastAt = rows.at(-1)?.createdAt ?? this.deps.clock.now();
+    const { session, worktree } = await this.spawn(
+      {
+        projectId: input.projectId,
+        agent: input.source,
+        worktree: input.worktree,
+        firstMessage: '',
+        toggles: input.toggles,
+        model: input.model,
+        ...(input.permissionMode !== undefined ? { permissionMode: input.permissionMode } : {}),
+        ...(input.effort !== undefined ? { effort: input.effort } : {}),
+      },
+      {
+        cliSessionId: input.chatId,
+        beforeLaunch: async (s, w) => {
+          // Claude Code resumes only sessions filed under the folder it runs in: the lane gets a copy.
+          if (input.source === 'claude') await placeClaudeSession(deps, read.file, w.path, input.chatId);
+          transcript.importRows(s.id, rows);
+          // Named by what the person first asked; active as of the chat's last message, so a relaunch replays nothing.
+          repos.sessions.upsert({ ...this.require(s.id), firstMessage: firstUser, lastActivityAt: lastAt });
+          publisher.upsert('sessions', [s.id]);
+        },
+      },
+    );
+    this.deps.activity.append({
+      who: AGENT_LABEL[session.agent],
+      what: fill(copy.importChat.activity, { project: project.name }),
+      projectId: project.id,
+      sessionId: session.id,
+    });
+    return { sessionId: session.id, worktreeId: worktree.id };
   }
 
   private async launch(

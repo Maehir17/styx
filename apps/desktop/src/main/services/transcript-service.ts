@@ -35,6 +35,26 @@ export class TranscriptService {
     return message;
   }
 
+  /** An imported chat's rows at once, each with its own original time (one delta for the lot). */
+  importRows(
+    sessionId: SessionId,
+    rows: readonly { body: string; payload: MessagePayload; createdAt: number }[],
+  ): TranscriptMessage[] {
+    let seq = this.repos.transcripts.nextSeq(sessionId);
+    const messages = rows.map((r): TranscriptMessage => ({
+      id: newId<'MessageId'>(),
+      sessionId,
+      seq: seq++,
+      body: redact(r.body),
+      payload: redact(r.payload),
+      askId: null,
+      createdAt: r.createdAt,
+    }));
+    for (const m of messages) this.repos.transcripts.upsert(m);
+    if (messages.length > 0) this.publisher.transcriptAppend(sessionId, messages);
+    return messages;
+  }
+
   system(sessionId: SessionId, body: string): TranscriptMessage {
     return this.append(sessionId, body, { kind: 'system' });
   }

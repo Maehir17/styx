@@ -27,6 +27,8 @@ export type ModalPayload =
   | { modal: 'new-project'; mode?: 'new' | 'clone' }
   /** Recents + scanned repos with checkboxes → `project.add` each (rail menu, Home, palette; discrepancies #53). */
   | { modal: 'add-existing' }
+  /** A past Claude Code / Codex chat of the project → a task that carries it on (`session.importChat`; New task). */
+  | { modal: 'import-chat'; projectId: ProjectId }
   /**
    * projectId is null during onboarding (no project yet); provider/targetId preselect the flow (Reconnect, step 4).
    * `chooseProject` opens only the project picker for `targetId` (Settings › Targets "Choose project", issue #5).

@@ -193,6 +193,8 @@ export interface ContainerOptions {
   onAppSettings?: (settings: AppSettings) => void;
   fetch?: typeof fetch;
   detect?: DetectService;
+  /** Where Claude Code / Codex keep their chats (chat import); defaults to this machine's home and env. */
+  chatHistory?: { home: string; env: NodeJS.ProcessEnv };
   ideImport?: IdeImportService;
   pty?: PtyService;
   stream?: StreamRunnerLike;
@@ -401,6 +403,7 @@ export function buildContainer(opts: ContainerOptions): Container {
     redetectClis: opts.redetectClis ?? true,
     laneLedger: ledger,
     runtime,
+    ...(opts.chatHistory ? { chatHistory: opts.chatHistory } : {}),
   });
   sessions.backfillTasks();
   const design = new DesignService({ repos, git, sessions, transcript });

@@ -22,6 +22,7 @@ import {
   sessionIdSchema,
   targetIdSchema,
   targetPolicySchema,
+  timestampSchema,
   worktreeIdSchema,
 } from '../model/common';
 import {
@@ -115,6 +116,20 @@ const scannedRepoSchema = z.object({
   /** Unchecked by default when no remote and stale (spec §4.9). */
   suggested: z.boolean(),
 });
+
+/** Which CLI a past chat came from (an imported chat continues with that agent). */
+export const importSourceSchema = z.enum(['claude', 'codex']);
+/** A CLI's own session id: Claude Code's file name, Codex's `session_meta.payload.id`. */
+export const importChatIdSchema = z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{5,127}$/);
+export const importableChatSchema = z.object({
+  source: importSourceSchema,
+  id: importChatIdSchema,
+  /** The first thing the person typed, one line. */
+  title: z.string(),
+  startedAt: timestampSchema,
+  updatedAt: timestampSchema,
+});
+export type ImportableChat = z.infer<typeof importableChatSchema>;
 
 const readModelSnapshotSchema = z.object({
   seq: z.number().int().nonnegative(),
@@ -647,6 +662,28 @@ export const commands = {
       /** A build task started from a design task: linked both ways, told when the design changes. */
       designSessionId: sessionIdSchema.optional(),
       taskTargetId: targetIdSchema.optional(),
+    }),
+    output: z.object({ sessionId: sessionIdSchema, worktreeId: worktreeIdSchema }),
+  },
+  /** This project's past Claude Code and Codex chats on this machine, newest first (where they live stays in main). */
+  'session.importableChats': {
+    input: z.object({ projectId: projectIdSchema }),
+    output: z.object({ chats: z.array(importableChatSchema) }),
+  },
+  /**
+   * Brings one of those chats in as a task on a new lane: its transcript as it was, and the CLI's own session
+   * resumed by id, so the next message carries on the conversation.
+   */
+  'session.importChat': {
+    input: z.object({
+      projectId: projectIdSchema,
+      source: importSourceSchema,
+      chatId: importChatIdSchema,
+      worktree: z.object({ kind: z.literal('new'), base: z.string().min(1), branch: z.string().min(1) }),
+      toggles: sessionTogglesSchema,
+      model: z.string().nullable().default(null),
+      permissionMode: permissionModeSchema.default('default'),
+      effort: effortSchema.nullable().default(null),
     }),
     output: z.object({ sessionId: sessionIdSchema, worktreeId: worktreeIdSchema }),
   },
